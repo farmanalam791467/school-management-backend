@@ -33,6 +33,9 @@ const reportRoutes = require('./routes/reports');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust proxy for express-rate-limit behind reverse proxy (e.g. Render)
+app.set('trust proxy', 1);
+
 // Security Middleware
 app.use(helmet({
   crossOriginResourcePolicy: false, // Allow loading local uploads on frontend
