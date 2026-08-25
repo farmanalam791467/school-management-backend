@@ -21,9 +21,10 @@ async function main() {
   for (const password of commonPasswords) {
     try {
       connection = await mysql.createConnection({
-        host: 'localhost',
+        host: '127.0.0.1',
         user: 'root',
-        password: password
+        password: password,
+        multipleStatements: true
       });
       workingPassword = password;
       console.log(`✔ Connected successfully with password: "${password}"`);
@@ -61,24 +62,15 @@ async function main() {
     }
     
     const sqlContent = fs.readFileSync(sqlPath, 'utf8');
-    // Split queries by semicolon (simple split, ignoring comments/strings for basic setup)
-    // To be safe, we can split by semicolon followed by newline
-    const queries = sqlContent
-      .split(/;\s*$/m)
-      .map(q => q.trim())
-      .filter(q => q.length > 0 && !q.startsWith('--'));
+    // Strip client-side DELIMITER commands and replace trigger delimiters (//) with normal semicolon (;)
+    const cleanSql = sqlContent
+      .replace(/\r\n/g, '\n')
+      .replace(/DELIMITER\s+\/\/([\s\S]*?)DELIMITER\s+;/g, (match, body) => {
+        return body.replace(/END\/\//g, 'END;').replace(/\/\//g, ';');
+      });
 
-    console.log(`Executing ${queries.length} SQL queries to build schema and seed data...`);
-    for (let i = 0; i < queries.length; i++) {
-      try {
-        await connection.query(queries[i]);
-      } catch (err) {
-        // Ignore duplicate entry or table already exists warnings if re-running
-        if (!err.message.includes('already exists') && !err.message.includes('Duplicate entry')) {
-          console.warn(`⚠️ Warning executing query ${i + 1}: ${err.message}`);
-        }
-      }
-    }
+    console.log('Executing database schema and seed data...');
+    await connection.query(cleanSql);
     console.log('✔ Database schema and seed data imported successfully.');
 
     // 4. Update .env file

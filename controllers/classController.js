@@ -101,7 +101,7 @@ exports.getClassSubjects = async (req, res) => {
   const { classId, sectionId } = req.query;
   try {
     let query = `
-      SELECT cs.id, c.name AS class_name, s.name AS section_name, sub.name AS subject_name, sub.code AS subject_code, sub.type AS subject_type, u.name AS teacher_name, cs.teacher_id
+      SELECT cs.id, cs.class_id, cs.section_id, cs.subject_id, c.name AS class_name, s.name AS section_name, sub.name AS subject_name, sub.code AS subject_code, sub.type AS subject_type, u.name AS teacher_name, cs.teacher_id
       FROM class_subjects cs
       JOIN classes c ON cs.class_id = c.id
       JOIN sections s ON cs.section_id = s.id
