@@ -75,7 +75,10 @@ exports.getStudents = async (req, res) => {
       section_name: student.section ? student.section.name : '',
       user_status: student.user ? student.user.status : 'inactive',
       father_name: student.parent ? student.parent.father_name : '',
-      father_phone: student.parent ? student.parent.father_phone : ''
+      father_phone: student.parent ? student.parent.father_phone : '',
+      gender: student.gender || '',
+      dob: student.dob,
+      blood_group: student.blood_group || ''
     }));
 
     res.json({
