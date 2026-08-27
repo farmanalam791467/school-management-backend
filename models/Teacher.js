@@ -7,6 +7,19 @@ const teacherSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  employee_id: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  designation: {
+    type: String,
+    required: true
+  },
+  department: {
+    type: String,
+    required: true
+  },
   qualification: {
     type: String
   },

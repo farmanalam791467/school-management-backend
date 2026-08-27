@@ -172,7 +172,9 @@ app.get('/api/seed', async (req, res) => {
 
     const teacherProfile = new Teacher({
       user: teacherUser._id,
-      teacher_id: 'TCH-001',
+      employee_id: 'TCH-001',
+      designation: 'Senior Teacher',
+      department: 'Mathematics',
       qualification: 'Master of Science (M.Sc)',
       experience: '5 Years',
       specialization: 'Mathematics & physics',
