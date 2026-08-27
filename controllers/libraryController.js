@@ -1,21 +1,39 @@
-const db = require('../config/db');
+const LibraryBook = require('../models/LibraryBook');
+const User = require('../models/User');
+const AccountsLedger = require('../models/AccountsLedger');
 
 // Get books
 exports.getBooks = async (req, res) => {
   const search = req.query.search || '';
   try {
-    let query = 'SELECT * FROM library_books WHERE 1=1';
-    const params = [];
+    const filter = {};
 
     if (search) {
-      query += ' AND (title LIKE ? OR isbn LIKE ? OR author LIKE ? OR barcode LIKE ?)';
-      const searchWild = `%${search}%`;
-      params.push(searchWild, searchWild, searchWild, searchWild);
+      filter.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { isbn: { $regex: search, $options: 'i' } },
+        { author: { $regex: search, $options: 'i' } },
+        { barcode: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    query += ' ORDER BY id DESC';
-    const [books] = await db.query(query, params);
-    res.json({ books });
+    const books = await LibraryBook.find(filter).sort({ created_at: -1 });
+    
+    const formattedBooks = books.map(b => ({
+      id: b._id.toString(),
+      title: b.title,
+      isbn: b.isbn,
+      author: b.author,
+      publisher: b.publisher || '',
+      subject: b.subject || '',
+      quantity: b.quantity,
+      rack_number: b.rack_number || '',
+      price: b.price || 0,
+      barcode: b.barcode,
+      status: b.status
+    }));
+
+    res.json({ books: formattedBooks });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching books' });
@@ -30,11 +48,19 @@ exports.createBook = async (req, res) => {
   }
 
   try {
-    await db.query(
-      `INSERT INTO library_books (title, isbn, author, publisher, subject, quantity, rack_number, price, barcode, status) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Available')`,
-      [title, isbn, author, publisher || '', subject || '', quantity || 1, rack_number || '', price || 0.00, barcode]
-    );
+    const newBook = new LibraryBook({
+      title,
+      isbn,
+      author,
+      publisher: publisher || '',
+      subject: subject || '',
+      quantity: quantity || 1,
+      rack_number: rack_number || '',
+      price: price || 0.00,
+      barcode,
+      status: 'Available'
+    });
+    await newBook.save();
     res.status(201).json({ message: 'Book added to library successfully' });
   } catch (err) {
     console.error(err);
@@ -49,42 +75,35 @@ exports.issueBook = async (req, res) => {
     return res.status(400).json({ message: 'Book ID, User ID, and Due Date are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // 1. Check book availability
-    const [books] = await conn.query('SELECT quantity, status FROM library_books WHERE id = ?', [book_id]);
-    if (books.length === 0) {
+    const book = await LibraryBook.findById(book_id);
+    if (!book) {
       return res.status(404).json({ message: 'Book not found' });
     }
 
-    const book = books[0];
     if (book.quantity <= 0 || book.status === 'Out of Stock') {
       return res.status(400).json({ message: 'Book is currently out of stock' });
     }
 
-    // 2. Insert issue record
-    const issueDate = new Date().toISOString().slice(0, 10);
-    await conn.query(
-      `INSERT INTO library_issues (book_id, user_id, issue_date, due_date, status) 
-       VALUES (?, ?, ?, ?, 'Issued')`,
-      [book_id, user_id, issueDate, due_date]
-    );
+    // Insert issue record
+    book.issues.push({
+      user: user_id,
+      issue_date: new Date(),
+      due_date: new Date(due_date),
+      status: 'Issued'
+    });
 
-    // 3. Decrement book quantity
-    const newQty = book.quantity - 1;
-    const status = newQty === 0 ? 'Out of Stock' : 'Available';
-    await conn.query('UPDATE library_books SET quantity = ?, status = ? WHERE id = ?', [newQty, status, book_id]);
+    // Decrement book quantity
+    book.quantity = book.quantity - 1;
+    if (book.quantity === 0) {
+      book.status = 'Out of Stock';
+    }
 
-    await conn.commit();
+    await book.save();
     res.json({ message: 'Book issued successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error issuing book: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -95,66 +114,60 @@ exports.returnBook = async (req, res) => {
     return res.status(400).json({ message: 'Issue ID is required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // 1. Fetch issue record
-    const [issues] = await conn.query('SELECT * FROM library_issues WHERE id = ? AND status = "Issued"', [issue_id]);
-    if (issues.length === 0) {
+    const book = await LibraryBook.findOne({ 'issues._id': issue_id });
+    if (!book) {
       return res.status(404).json({ message: 'Active book issue record not found' });
     }
 
-    const issue = issues[0];
-    const returnDate = new Date().toISOString().slice(0, 10);
+    const issue = book.issues.id(issue_id);
+    if (!issue || issue.status !== 'Issued') {
+      return res.status(404).json({ message: 'Active book issue record not found' });
+    }
+
+    const returnDate = new Date();
     
     // Calculate fine (e.g., $1 per day late)
     const dueDateObj = new Date(issue.due_date);
-    const returnDateObj = new Date(returnDate);
     let fineAmount = 0;
     
-    if (returnDateObj > dueDateObj) {
-      const diffTime = Math.abs(returnDateObj - dueDateObj);
+    if (returnDate > dueDateObj) {
+      const diffTime = Math.abs(returnDate - dueDateObj);
       const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
       fineAmount = diffDays * 1.00; // $1.00 fine per day
     }
 
-    // 2. Update issue record
-    await conn.query(
-      'UPDATE library_issues SET return_date = ?, fine_amount = ?, status = "Returned" WHERE id = ?',
-      [returnDate, fineAmount, issue_id]
-    );
+    // Update issue record
+    issue.return_date = returnDate;
+    issue.fine_amount = fineAmount;
+    issue.status = 'Returned';
 
-    // 3. Increment book quantity
-    const [books] = await conn.query('SELECT quantity FROM library_books WHERE id = ?', [issue.book_id]);
-    const newQty = books[0].quantity + 1;
-    await conn.query('UPDATE library_books SET quantity = ?, status = "Available" WHERE id = ?', [newQty, issue.book_id]);
+    // Increment book quantity
+    book.quantity = book.quantity + 1;
+    book.status = 'Available';
 
-    // 4. If fine is charged, log it as Income in the accounts ledger
+    await book.save();
+
+    // If fine is charged, log it as Income in the accounts ledger
     if (fineAmount > 0) {
-      // Find user name
-      const [users] = await conn.query('SELECT name FROM users WHERE id = ?', [issue.user_id]);
-      const userName = users.length > 0 ? users[0].name : 'User';
+      const user = await User.findById(issue.user);
+      const userName = user ? user.name : 'User';
       
-      await conn.query(
-        `INSERT INTO accounts_ledger (type, category, title, amount, date, description) 
-         VALUES ('Income', 'Library', ?, ?, ?, 'Library late return fine')`,
-        [
-          `Library Fine from ${userName}`,
-          fineAmount,
-          returnDate
-        ]
-      );
+      const ledgerEntry = new AccountsLedger({
+        date: returnDate,
+        type: 'Income',
+        category: 'Library',
+        title: `Library Fine from ${userName}`,
+        description: 'Library late return fine',
+        amount: fineAmount
+      });
+      await ledgerEntry.save();
     }
 
-    await conn.commit();
     res.json({ message: 'Book returned successfully', fineAmount });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error returning book: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -162,26 +175,37 @@ exports.returnBook = async (req, res) => {
 exports.getIssues = async (req, res) => {
   const { status, userId } = req.query;
   try {
-    let query = `
-      SELECT li.*, lb.title, lb.isbn, u.name as user_name, u.role as user_role
-      FROM library_issues li
-      JOIN library_books lb ON li.book_id = lb.id
-      JOIN users u ON li.user_id = u.id
-      WHERE 1=1
-    `;
-    const params = [];
+    const books = await LibraryBook.find({}).populate('issues.user', 'name role');
 
-    if (status) {
-      query += ' AND li.status = ?';
-      params.push(status);
-    }
-    if (userId) {
-      query += ' AND li.user_id = ?';
-      params.push(userId);
-    }
+    const issues = [];
+    books.forEach(book => {
+      book.issues.forEach(issue => {
+        let match = true;
+        if (status && issue.status !== status) match = false;
+        if (userId && issue.user && issue.user._id.toString() !== userId) match = false;
 
-    query += ' ORDER BY li.id DESC';
-    const [issues] = await db.query(query, params);
+        if (match && issue.user) {
+          issues.push({
+            id: issue._id.toString(),
+            book_id: book._id.toString(),
+            title: book.title,
+            isbn: book.isbn,
+            user_id: issue.user._id.toString(),
+            user_name: issue.user.name,
+            user_role: issue.user.role,
+            issue_date: issue.issue_date,
+            due_date: issue.due_date,
+            return_date: issue.return_date || null,
+            fine_amount: issue.fine_amount || 0,
+            status: issue.status
+          });
+        }
+      });
+    });
+
+    // Sort issues by issue_date desc
+    issues.sort((a, b) => new Date(b.issue_date) - new Date(a.issue_date));
+
     res.json({ issues });
   } catch (err) {
     console.error(err);

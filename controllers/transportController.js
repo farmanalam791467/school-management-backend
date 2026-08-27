@@ -1,19 +1,28 @@
-const db = require('../config/db');
+const TransportRoute = require('../models/TransportRoute');
+const TransportVehicle = require('../models/TransportVehicle');
+const StudentTransport = require('../models/StudentTransport');
 
 // Get all routes
 exports.getRoutes = async (req, res) => {
   try {
-    const [routes] = await db.query('SELECT * FROM transport_routes ORDER BY id DESC');
+    const routes = await TransportRoute.find().sort({ created_at: -1 });
     
-    // For each route, fetch its pickup points
-    const routesWithPoints = await Promise.all(
-      routes.map(async (route) => {
-        const [points] = await db.query('SELECT * FROM transport_pickup_points WHERE route_id = ? ORDER BY pickup_time ASC', [route.id]);
-        return { ...route, pickupPoints: points };
-      })
-    );
+    const formattedRoutes = routes.map(route => ({
+      id: route._id.toString(),
+      route_name: route.route_name,
+      start_point: route.start_point,
+      end_point: route.end_point,
+      fare: route.fare,
+      pickupPoints: route.pickup_points.map(pt => ({
+        id: pt._id.toString(),
+        route_id: route._id.toString(),
+        point_name: pt.point_name,
+        pickup_time: pt.pickup_time,
+        monthly_fee: pt.monthly_fee
+      }))
+    }));
 
-    res.json({ routes: routesWithPoints });
+    res.json({ routes: formattedRoutes });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching routes' });
@@ -28,10 +37,13 @@ exports.createRoute = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'INSERT INTO transport_routes (route_name, start_point, end_point, fare) VALUES (?, ?, ?, ?)',
-      [route_name, start_point, end_point, fare]
-    );
+    const newRoute = new TransportRoute({
+      route_name,
+      start_point,
+      end_point,
+      fare: parseFloat(fare)
+    });
+    await newRoute.save();
     res.status(201).json({ message: 'Transport route created successfully' });
   } catch (err) {
     console.error(err);
@@ -47,10 +59,18 @@ exports.createPickupPoint = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'INSERT INTO transport_pickup_points (route_id, point_name, pickup_time, monthly_fee) VALUES (?, ?, ?, ?)',
-      [route_id, point_name, pickup_time, monthly_fee]
-    );
+    const route = await TransportRoute.findById(route_id);
+    if (!route) {
+      return res.status(404).json({ message: 'Transport route not found' });
+    }
+
+    route.pickup_points.push({
+      point_name,
+      pickup_time,
+      monthly_fee: parseFloat(monthly_fee)
+    });
+    await route.save();
+
     res.status(201).json({ message: 'Pickup point added successfully' });
   } catch (err) {
     console.error(err);
@@ -61,8 +81,17 @@ exports.createPickupPoint = async (req, res) => {
 // Get all vehicles
 exports.getVehicles = async (req, res) => {
   try {
-    const [vehicles] = await db.query('SELECT * FROM transport_vehicles ORDER BY id DESC');
-    res.json({ vehicles });
+    const vehicles = await TransportVehicle.find().sort({ created_at: -1 });
+    const formattedVehicles = vehicles.map(v => ({
+      id: v._id.toString(),
+      vehicle_no: v.vehicle_no,
+      model: v.model,
+      capacity: v.capacity,
+      driver_name: v.driver_name,
+      driver_phone: v.driver_phone,
+      driver_license: v.driver_license
+    }));
+    res.json({ vehicles: formattedVehicles });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching vehicles' });
@@ -77,11 +106,15 @@ exports.createVehicle = async (req, res) => {
   }
 
   try {
-    await db.query(
-      `INSERT INTO transport_vehicles (vehicle_no, model, capacity, driver_name, driver_phone, driver_license) 
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [vehicle_no, model, capacity, driver_name, driver_phone, driver_license]
-    );
+    const newVehicle = new TransportVehicle({
+      vehicle_no,
+      model,
+      capacity: parseInt(capacity, 10),
+      driver_name,
+      driver_phone,
+      driver_license
+    });
+    await newVehicle.save();
     res.status(201).json({ message: 'Vehicle added successfully' });
   } catch (err) {
     console.error(err);
@@ -97,12 +130,15 @@ exports.allocateStudent = async (req, res) => {
   }
 
   try {
-    const startDate = new Date().toISOString().slice(0, 10);
-    await db.query(
-      `INSERT INTO student_transport (student_id, route_id, pickup_point_id, start_date) 
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE route_id = VALUES(route_id), pickup_point_id = VALUES(pickup_point_id)`,
-      [student_id, route_id, pickup_point_id, startDate]
+    await StudentTransport.findOneAndUpdate(
+      { student: student_id },
+      {
+        student: student_id,
+        route: route_id,
+        pickup_point_id,
+        start_date: new Date()
+      },
+      { upsert: true, new: true }
     );
     res.json({ message: 'Student allocated to transport successfully' });
   } catch (err) {
@@ -115,7 +151,7 @@ exports.allocateStudent = async (req, res) => {
 exports.deallocateStudent = async (req, res) => {
   const { studentId } = req.params;
   try {
-    await db.query('DELETE FROM student_transport WHERE student_id = ?', [studentId]);
+    await StudentTransport.findOneAndDelete({ student: studentId });
     res.json({ message: 'Student removed from transport successfully' });
   } catch (err) {
     console.error(err);

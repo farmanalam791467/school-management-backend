@@ -1,10 +1,21 @@
-const db = require('../config/db');
+const Event = require('../models/Event');
 
 // Get all events
 exports.getEvents = async (req, res) => {
   try {
-    const [events] = await db.query('SELECT * FROM events ORDER BY start_date ASC');
-    res.json({ events });
+    const events = await Event.find().sort({ start_date: 1 });
+    
+    const formattedEvents = events.map(e => ({
+      id: e._id.toString(),
+      title: e.title,
+      description: e.description || '',
+      start_date: e.start_date,
+      end_date: e.end_date,
+      type: e.type || 'Event',
+      created_by: e.created_by ? e.created_by.toString() : null
+    }));
+
+    res.json({ events: formattedEvents });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching events' });
@@ -19,10 +30,15 @@ exports.createEvent = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'INSERT INTO events (title, description, start_date, end_date, type) VALUES (?, ?, ?, ?, ?)',
-      [title, description || '', start_date, end_date, type || 'Event']
-    );
+    const newEvent = new Event({
+      title,
+      description: description || '',
+      start_date: new Date(start_date),
+      end_date: new Date(end_date),
+      type: type || 'Event',
+      created_by: req.user.id
+    });
+    await newEvent.save();
     res.status(201).json({ message: 'Event created successfully' });
   } catch (err) {
     console.error(err);
@@ -34,7 +50,7 @@ exports.createEvent = async (req, res) => {
 exports.deleteEvent = async (req, res) => {
   const { id } = req.params;
   try {
-    await db.query('DELETE FROM events WHERE id = ?', [id]);
+    await Event.findByIdAndDelete(id);
     res.json({ message: 'Event deleted successfully' });
   } catch (err) {
     console.error(err);

@@ -1,4 +1,9 @@
-const db = require('../config/db');
+const Chat = require('../models/Chat');
+const User = require('../models/User');
+const Student = require('../models/Student');
+const Parent = require('../models/Parent');
+const Teacher = require('../models/Teacher');
+const ClassSubject = require('../models/ClassSubject');
 
 // Get chat contacts (users they can chat with)
 exports.getContacts = async (req, res) => {
@@ -6,35 +11,71 @@ exports.getContacts = async (req, res) => {
   const currentUserId = req.user.id;
 
   try {
-    let query = 'SELECT id, name, role, email, phone, avatar FROM users WHERE id != ? AND status = "active"';
-    const params = [currentUserId];
+    let contacts = [];
 
-    // Restrict contacts based on role for better privacy
     if (currentRole === 'student') {
       // Students can chat with their teachers
-      query = `
-        SELECT DISTINCT u.id, u.name, u.role, u.email, u.phone, u.avatar 
-        FROM users u
-        JOIN class_subjects cs ON cs.teacher_id = u.id
-        JOIN students s ON s.class_id = cs.class_id AND s.section_id = cs.section_id
-        WHERE s.user_id = ? AND u.status = "active"
-      `;
-      params.splice(0, 1, currentUserId);
+      const student = await Student.findOne({ user: currentUserId });
+      if (student) {
+        const classSubjects = await ClassSubject.find({
+          class: student.class,
+          section: student.section
+        }).populate({
+          path: 'teacher',
+          populate: { path: 'user', select: 'name email phone avatar role status' }
+        });
+
+        // Filter unique active teacher users
+        const teacherUsersMap = {};
+        classSubjects.forEach(cs => {
+          if (cs.teacher && cs.teacher.user && cs.teacher.user.status === 'active') {
+            teacherUsersMap[cs.teacher.user._id.toString()] = cs.teacher.user;
+          }
+        });
+        contacts = Object.values(teacherUsersMap);
+      }
     } else if (currentRole === 'parent') {
       // Parents can chat with their children's teachers
-      query = `
-        SELECT DISTINCT u.id, u.name, u.role, u.email, u.phone, u.avatar 
-        FROM users u
-        JOIN class_subjects cs ON cs.teacher_id = u.id
-        JOIN students s ON s.class_id = cs.class_id AND s.section_id = cs.section_id
-        JOIN parents p ON s.parent_id = p.id
-        WHERE p.user_id = ? AND u.status = "active"
-      `;
-      params.splice(0, 1, currentUserId);
+      const parent = await Parent.findOne({ user: currentUserId });
+      if (parent) {
+        const children = await Student.find({ parent: parent._id });
+        const classIds = children.map(c => c.class);
+        const sectionIds = children.map(c => c.section);
+
+        const classSubjects = await ClassSubject.find({
+          class: { $in: classIds },
+          section: { $in: sectionIds }
+        }).populate({
+          path: 'teacher',
+          populate: { path: 'user', select: 'name email phone avatar role status' }
+        });
+
+        const teacherUsersMap = {};
+        classSubjects.forEach(cs => {
+          if (cs.teacher && cs.teacher.user && cs.teacher.user.status === 'active') {
+            teacherUsersMap[cs.teacher.user._id.toString()] = cs.teacher.user;
+          }
+        });
+        contacts = Object.values(teacherUsersMap);
+      }
+    } else {
+      // Staff, teachers, and admins can chat with any active user (except themselves)
+      contacts = await User.find({
+        _id: { $ne: currentUserId },
+        status: 'active'
+      }).select('name role email phone avatar status');
     }
 
-    const [contacts] = await db.query(query, params);
-    res.json({ contacts });
+    const formattedContacts = contacts.map(c => ({
+      id: c._id.toString(),
+      name: c.name,
+      role: c.role,
+      email: c.email || '',
+      phone: c.phone || '',
+      avatar: c.avatar || ''
+    }));
+
+    res.json({ contacts: formattedContacts });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching contacts' });
@@ -48,21 +89,29 @@ exports.getMessages = async (req, res) => {
 
   try {
     // Mark messages as read
-    await db.query(
-      'UPDATE chats SET is_read = TRUE WHERE sender_id = ? AND receiver_id = ?',
-      [contactId, userId]
+    await Chat.updateMany(
+      { sender: contactId, receiver: userId },
+      { is_read: true }
     );
 
     // Fetch messages
-    const [messages] = await db.query(
-      `SELECT * FROM chats 
-       WHERE (sender_id = ? AND receiver_id = ?) 
-          OR (sender_id = ? AND receiver_id = ?) 
-       ORDER BY id ASC`,
-      [userId, contactId, contactId, userId]
-    );
+    const messages = await Chat.find({
+      $or: [
+        { sender: userId, receiver: contactId },
+        { sender: contactId, receiver: userId }
+      ]
+    }).sort({ created_at: 1 });
 
-    res.json({ messages });
+    const formattedMessages = messages.map(msg => ({
+      id: msg._id.toString(),
+      sender_id: msg.sender.toString(),
+      receiver_id: msg.receiver.toString(),
+      message: msg.message,
+      is_read: msg.is_read,
+      created_at: msg.created_at
+    }));
+
+    res.json({ messages: formattedMessages });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching messages' });
@@ -79,20 +128,23 @@ exports.sendMessage = async (req, res) => {
   }
 
   try {
-    const [result] = await db.query(
-      'INSERT INTO chats (sender_id, receiver_id, message, is_read) VALUES (?, ?, ?, FALSE)',
-      [sender_id, receiver_id, message]
-    );
+    const newChat = new Chat({
+      sender: sender_id,
+      receiver: receiver_id,
+      message,
+      is_read: false
+    });
+    await newChat.save();
 
     res.status(201).json({
       message: 'Message sent successfully',
       chat: {
-        id: result.insertId,
+        id: newChat._id.toString(),
         sender_id,
         receiver_id,
         message,
         is_read: false,
-        created_at: new Date()
+        created_at: newChat.created_at
       }
     });
   } catch (err) {

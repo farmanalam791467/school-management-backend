@@ -1,10 +1,22 @@
-const db = require('../config/db');
+const FeeInvoice = require('../models/FeeInvoice');
+const FeeType = require('../models/FeeType');
+const Student = require('../models/Student');
+const User = require('../models/User');
+const AccountsLedger = require('../models/AccountsLedger');
 
 // Get fee types
 exports.getFeeTypes = async (req, res) => {
   try {
-    const [types] = await db.query('SELECT * FROM fee_types ORDER BY id DESC');
-    res.json({ feeTypes: types });
+    const types = await FeeType.find().sort({ created_at: -1 });
+    const formattedTypes = types.map(t => ({
+      id: t._id.toString(),
+      name: t.name,
+      code: t.code,
+      description: t.description || '',
+      amount: t.amount,
+      due_date: t.due_date
+    }));
+    res.json({ feeTypes: formattedTypes });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching fee types' });
@@ -18,10 +30,14 @@ exports.createFeeType = async (req, res) => {
     return res.status(400).json({ message: 'Name, code, amount, and due date are required' });
   }
   try {
-    await db.query(
-      'INSERT INTO fee_types (name, code, description, amount, due_date) VALUES (?, ?, ?, ?, ?)',
-      [name, code, description || '', amount, due_date]
-    );
+    const newFeeType = new FeeType({
+      name,
+      code,
+      description: description || '',
+      amount: parseFloat(amount),
+      due_date: new Date(due_date)
+    });
+    await newFeeType.save();
     res.status(201).json({ message: 'Fee type created successfully' });
   } catch (err) {
     console.error(err);
@@ -33,52 +49,69 @@ exports.createFeeType = async (req, res) => {
 exports.getInvoices = async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
-  const offset = (page - 1) * limit;
+  const skip = (page - 1) * limit;
   const status = req.query.status || '';
   const search = req.query.search || '';
 
   try {
-    let countQuery = `
-      SELECT COUNT(*) as total 
-      FROM fee_invoices fi
-      JOIN students s ON fi.student_id = s.id
-      JOIN users u ON s.user_id = u.id
-      WHERE 1=1
-    `;
-    let dataQuery = `
-      SELECT fi.*, u.name as student_name, s.roll_number, c.name as class_name, sec.name as section_name
-      FROM fee_invoices fi
-      JOIN students s ON fi.student_id = s.id
-      JOIN users u ON s.user_id = u.id
-      JOIN classes c ON s.class_id = c.id
-      JOIN sections sec ON s.section_id = sec.id
-      WHERE 1=1
-    `;
-    const params = [];
-
+    const filter = {};
     if (status) {
-      countQuery += ' AND fi.status = ?';
-      dataQuery += ' AND fi.status = ?';
-      params.push(status);
+      filter.status = status;
     }
 
     if (search) {
-      countQuery += ' AND (u.name LIKE ? OR fi.invoice_no LIKE ? OR s.roll_number LIKE ?)';
-      dataQuery += ' AND (u.name LIKE ? OR fi.invoice_no LIKE ? OR s.roll_number LIKE ?)';
-      const searchWild = `%${search}%`;
-      params.push(searchWild, searchWild, searchWild);
+      const matchingUsers = await User.find({
+        name: { $regex: search, $options: 'i' }
+      });
+      const userIds = matchingUsers.map(u => u._id);
+
+      const matchingStudents = await Student.find({
+        $or: [
+          { user: { $in: userIds } },
+          { roll_number: { $regex: search, $options: 'i' } }
+        ]
+      });
+      const studentIds = matchingStudents.map(s => s._id);
+
+      filter.$or = [
+        { student: { $in: studentIds } },
+        { invoice_number: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    const [counts] = await db.query(countQuery, params);
-    const total = counts[0].total;
+    const total = await FeeInvoice.countDocuments(filter);
 
-    dataQuery += ' ORDER BY fi.id DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    const invoices = await FeeInvoice.find(filter)
+      .populate({
+        path: 'student',
+        populate: [
+          { path: 'user', select: 'name' },
+          { path: 'class', select: 'name' },
+          { path: 'section', select: 'name' }
+        ]
+      })
+      .sort({ created_at: -1 })
+      .skip(skip)
+      .limit(limit);
 
-    const [invoices] = await db.query(dataQuery, params);
+    const formattedInvoices = invoices.map(inv => ({
+      id: inv._id.toString(),
+      student_id: inv.student ? inv.student._id.toString() : null,
+      invoice_no: inv.invoice_number,
+      date: inv.issue_date,
+      due_date: inv.due_date,
+      total_amount: inv.total,
+      discount: inv.discount || 0,
+      paid_amount: inv.paid_amount || 0,
+      status: inv.status,
+      student_name: inv.student && inv.student.user ? inv.student.user.name : '',
+      roll_number: inv.student ? inv.student.roll_number : '',
+      class_name: inv.student && inv.student.class ? inv.student.class.name : '',
+      section_name: inv.student && inv.student.section ? inv.student.section.name : ''
+    }));
 
     res.json({
-      invoices,
+      invoices: formattedInvoices,
       pagination: {
         total,
         page,
@@ -96,41 +129,60 @@ exports.getInvoices = async (req, res) => {
 exports.getInvoiceById = async (req, res) => {
   const { id } = req.params;
   try {
-    const [invoices] = await db.query(
-      `SELECT fi.*, u.name as student_name, u.email as student_email, u.phone as student_phone, 
-              s.roll_number, s.admission_no, c.name as class_name, sec.name as section_name,
-              p.father_name, p.father_phone
-       FROM fee_invoices fi
-       JOIN students s ON fi.student_id = s.id
-       JOIN users u ON s.user_id = u.id
-       JOIN classes c ON s.class_id = c.id
-       JOIN sections sec ON s.section_id = sec.id
-       LEFT JOIN parents p ON s.parent_id = p.id
-       WHERE fi.id = ?`,
-      [id]
-    );
+    const invoice = await FeeInvoice.findById(id)
+      .populate({
+        path: 'student',
+        populate: [
+          { path: 'user', select: 'name email phone avatar' },
+          { path: 'class', select: 'name' },
+          { path: 'section', select: 'name' },
+          { path: 'parent' }
+        ]
+      });
 
-    if (invoices.length === 0) {
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
-    // Fetch invoice details (items)
-    const [details] = await db.query(
-      `SELECT fid.*, ft.name as fee_name, ft.code as fee_code 
-       FROM fee_invoice_details fid
-       JOIN fee_types ft ON fid.fee_type_id = ft.id
-       WHERE fid.invoice_id = ?`,
-      [id]
-    );
+    const formattedInvoice = {
+      id: invoice._id.toString(),
+      student_id: invoice.student ? invoice.student._id.toString() : null,
+      invoice_no: invoice.invoice_number,
+      date: invoice.issue_date,
+      due_date: invoice.due_date,
+      total_amount: invoice.total,
+      discount: invoice.discount || 0,
+      paid_amount: invoice.paid_amount || 0,
+      status: invoice.status,
+      student_name: invoice.student && invoice.student.user ? invoice.student.user.name : '',
+      student_email: invoice.student && invoice.student.user ? invoice.student.user.email : '',
+      student_phone: invoice.student && invoice.student.user ? invoice.student.user.phone : '',
+      roll_number: invoice.student ? invoice.student.roll_number : '',
+      admission_no: invoice.student ? invoice.student.admission_number : '',
+      class_name: invoice.student && invoice.student.class ? invoice.student.class.name : '',
+      section_name: invoice.student && invoice.student.section ? invoice.student.section.name : '',
+      father_name: invoice.student && invoice.student.parent ? invoice.student.parent.father_name : '',
+      father_phone: invoice.student && invoice.student.parent ? invoice.student.parent.father_phone : ''
+    };
 
-    // Fetch payments made for this invoice
-    const [payments] = await db.query(
-      'SELECT * FROM fee_payments WHERE invoice_id = ? ORDER BY id DESC',
-      [id]
-    );
+    const details = invoice.items.map((item, idx) => ({
+      id: item._id.toString(),
+      invoice_id: invoice._id.toString(),
+      fee_name: item.fee_type,
+      amount: item.amount
+    }));
+
+    const payments = invoice.payments.map(pay => ({
+      id: pay._id.toString(),
+      invoice_id: invoice._id.toString(),
+      amount_paid: pay.amount,
+      payment_method: pay.method,
+      transaction_no: pay.reference || '',
+      payment_date: pay.payment_date
+    }));
 
     res.json({
-      invoice: invoices[0],
+      invoice: formattedInvoice,
       details,
       payments
     });
@@ -147,41 +199,38 @@ exports.createInvoice = async (req, res) => {
     return res.status(400).json({ message: 'Student ID and fee items are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // Calculate total amount
     const totalAmount = fee_types.reduce((acc, item) => acc + parseFloat(item.amount), 0);
     const invoiceNo = `INV-${Date.now()}`;
-    const date = new Date().toISOString().slice(0, 10);
-    // Due date is set to 15 days from now
-    const dueDate = new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const issueDate = new Date();
+    const dueDate = new Date(Date.now() + 15 * 24 * 60 * 60 * 1000); // 15 days due date
 
-    // Insert Invoice
-    const [invoiceResult] = await conn.query(
-      `INSERT INTO fee_invoices (student_id, invoice_no, date, due_date, total_amount, discount, fine, paid_amount, status)
-       VALUES (?, ?, ?, ?, ?, 0.00, 0.00, 0.00, 'Unpaid')`,
-      [student_id, invoiceNo, date, dueDate, totalAmount]
-    );
-    const invoiceId = invoiceResult.insertId;
-
-    // Insert Details
+    const items = [];
     for (const item of fee_types) {
-      await conn.query(
-        'INSERT INTO fee_invoice_details (invoice_id, fee_type_id, amount) VALUES (?, ?, ?)',
-        [invoiceId, item.fee_type_id, item.amount]
-      );
+      const ft = await FeeType.findById(item.fee_type_id);
+      items.push({
+        fee_type: ft ? ft.name : 'General School Fee',
+        amount: parseFloat(item.amount)
+      });
     }
 
-    await conn.commit();
-    res.status(201).json({ message: 'Invoice created successfully', invoiceId, invoiceNo });
+    const newInvoice = new FeeInvoice({
+      student: student_id,
+      invoice_number: invoiceNo,
+      issue_date: issueDate,
+      due_date: dueDate,
+      subtotal: totalAmount,
+      total: totalAmount,
+      paid_amount: 0,
+      status: 'Unpaid',
+      items
+    });
+    await newInvoice.save();
+
+    res.status(201).json({ message: 'Invoice created successfully', invoiceId: newInvoice._id.toString(), invoiceNo });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error creating invoice: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -192,59 +241,48 @@ exports.bulkGenerateInvoices = async (req, res) => {
     return res.status(400).json({ message: 'Class, Section, and Fee Type are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // 1. Get Fee Type details
-    const [types] = await conn.query('SELECT amount, due_date FROM fee_types WHERE id = ?', [fee_type_id]);
-    if (types.length === 0) {
+    const feeType = await FeeType.findById(fee_type_id);
+    if (!feeType) {
       return res.status(404).json({ message: 'Fee type not found' });
     }
-    const feeAmount = types[0].amount;
-    const dueDate = types[0].due_date;
-    const date = new Date().toISOString().slice(0, 10);
 
-    // 2. Get all students in the class/section
-    const [students] = await conn.query(
-      'SELECT id FROM students WHERE class_id = ? AND section_id = ? AND status = "active"',
-      [class_id, section_id]
-    );
+    const students = await Student.find({
+      class: class_id,
+      section: section_id,
+      status: 'active'
+    });
 
     if (students.length === 0) {
       return res.status(404).json({ message: 'No active students found in the selected class and section' });
     }
 
-    // 3. Create invoices
     let createdCount = 0;
     for (const student of students) {
-      const invoiceNo = `INV-B${class_id}${section_id}-${student.id}-${Date.now().toString().slice(-6)}`;
+      const invoiceNo = `INV-B${class_id.slice(-4)}${section_id.slice(-4)}-${student.roll_number}-${Date.now().toString().slice(-4)}`;
 
-      // Insert Invoice
-      const [invoiceResult] = await conn.query(
-        `INSERT INTO fee_invoices (student_id, invoice_no, date, due_date, total_amount, status)
-         VALUES (?, ?, ?, ?, ?, 'Unpaid')`,
-        [student.id, invoiceNo, date, dueDate, feeAmount]
-      );
-      const invoiceId = invoiceResult.insertId;
-
-      // Insert Details
-      await conn.query(
-        'INSERT INTO fee_invoice_details (invoice_id, fee_type_id, amount) VALUES (?, ?, ?)',
-        [invoiceId, fee_type_id, feeAmount]
-      );
-
+      const newInvoice = new FeeInvoice({
+        student: student._id,
+        invoice_number: invoiceNo,
+        issue_date: new Date(),
+        due_date: feeType.due_date,
+        subtotal: feeType.amount,
+        total: feeType.amount,
+        paid_amount: 0,
+        status: 'Unpaid',
+        items: [{
+          fee_type: feeType.name,
+          amount: feeType.amount
+        }]
+      });
+      await newInvoice.save();
       createdCount++;
     }
 
-    await conn.commit();
     res.json({ message: `Bulk invoices generated successfully for ${createdCount} students` });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error generating bulk invoices: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -255,48 +293,50 @@ exports.collectFee = async (req, res) => {
     return res.status(400).json({ message: 'Invoice ID, amount, and payment method are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // 1. Fetch invoice details
-    const [invoices] = await conn.query('SELECT total_amount, paid_amount, status FROM fee_invoices WHERE id = ?', [invoice_id]);
-    if (invoices.length === 0) {
+    const invoice = await FeeInvoice.findById(invoice_id);
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
-    const invoice = invoices[0];
-    const newPaidAmount = parseFloat(invoice.paid_amount) + parseFloat(amount_paid);
-    const totalAmount = parseFloat(invoice.total_amount);
+    const newPaidAmount = (invoice.paid_amount || 0) + parseFloat(amount_paid);
+    const totalAmount = invoice.total;
 
     let status = 'Partially Paid';
     if (newPaidAmount >= totalAmount) {
       status = 'Paid';
     }
 
-    // 2. Update Invoice
-    await conn.query(
-      'UPDATE fee_invoices SET paid_amount = ?, status = ? WHERE id = ?',
-      [newPaidAmount, status, invoice_id]
-    );
+    invoice.paid_amount = newPaidAmount;
+    invoice.status = status;
 
-    // 3. Insert Payment Record (triggers accounts ledger log via DB trigger)
-    const paymentDate = new Date().toISOString().slice(0, 10);
     const txnNo = transaction_no || `TXN-M${Date.now()}`;
+    const paymentDate = new Date();
 
-    await conn.query(
-      `INSERT INTO fee_payments (invoice_id, amount_paid, payment_method, transaction_no, payment_date)
-       VALUES (?, ?, ?, ?, ?)`,
-      [invoice_id, amount_paid, payment_method, txnNo, paymentDate]
-    );
+    invoice.payments.push({
+      amount: parseFloat(amount_paid),
+      method: payment_method,
+      reference: txnNo,
+      payment_date: paymentDate
+    });
 
-    await conn.commit();
+    await invoice.save();
+
+    // Manually insert log into AccountsLedger (Replacing SQL Trigger behavior)
+    const ledgerEntry = new AccountsLedger({
+      date: paymentDate,
+      type: 'Income',
+      category: 'Student Fee',
+      title: `Fee Payment - Invoice #${invoice.invoice_number}`,
+      description: `Collected fee for student. Method: ${payment_method}`,
+      amount: parseFloat(amount_paid),
+      reference: txnNo
+    });
+    await ledgerEntry.save();
+
     res.json({ message: 'Payment recorded successfully', invoiceStatus: status, transactionNo: txnNo });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error collecting fee' });
-  } finally {
-    conn.release();
   }
 };

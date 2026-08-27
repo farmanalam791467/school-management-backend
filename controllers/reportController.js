@@ -1,27 +1,60 @@
-const db = require('../config/db');
+const Student = require('../models/Student');
+const User = require('../models/User');
+const AccountsLedger = require('../models/AccountsLedger');
+const FeeInvoice = require('../models/FeeInvoice');
 const XLSX = require('xlsx');
 const PDFDocument = require('pdfkit');
+
+// Helper to filter dates by year and month
+const getDateRangeFilter = (year, month, dateFieldName) => {
+  const filter = {};
+  if (year || month) {
+    const y = year ? parseInt(year) : new Date().getFullYear();
+    filter[dateFieldName] = {};
+    if (month) {
+      const m = parseInt(month) - 1; // 0-indexed in JS
+      filter[dateFieldName].$gte = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
+      filter[dateFieldName].$lte = new Date(Date.UTC(y, m + 1, 0, 23, 59, 59, 999)); // Last day of month
+    } else {
+      filter[dateFieldName].$gte = new Date(Date.UTC(y, 0, 1, 0, 0, 0, 0));
+      filter[dateFieldName].$lte = new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999));
+    }
+  }
+  return filter;
+};
 
 // Get Students JSON Report
 exports.getStudentsReport = async (req, res) => {
   try {
     const { month, year } = req.query;
-    let query = `SELECT roll_number, admission_no, name, email, phone, class_name, section_name, gender, dob, blood_group, father_name, admission_date 
-                 FROM view_student_profiles 
-                 WHERE user_status = "active"`;
-    const params = [];
-    if (year) {
-      query += ` AND YEAR(admission_date) = ?`;
-      params.push(parseInt(year));
-    }
-    if (month) {
-      query += ` AND MONTH(admission_date) = ?`;
-      params.push(parseInt(month));
-    }
-    query += ` ORDER BY admission_date DESC`;
+    const filter = { status: 'active' };
+    
+    const dateFilter = getDateRangeFilter(year, month, 'admission_date');
+    Object.assign(filter, dateFilter);
 
-    const [students] = await db.query(query, params);
-    res.json({ success: true, data: students });
+    const students = await Student.find(filter)
+      .populate('user', 'name email phone status')
+      .populate('class', 'name')
+      .populate('section', 'name')
+      .populate('parent')
+      .sort({ admission_date: -1 });
+
+    const formattedStudents = students.map(student => ({
+      roll_number: student.roll_number,
+      admission_no: student.admission_number,
+      name: student.user ? student.user.name : '',
+      email: student.user ? student.user.email : '',
+      phone: student.user ? student.user.phone : '',
+      class_name: student.class ? student.class.name : '',
+      section_name: student.section ? student.section.name : '',
+      gender: student.gender || '',
+      dob: student.dob,
+      blood_group: student.blood_group || '',
+      father_name: student.parent ? student.parent.father_name : '',
+      admission_date: student.admission_date
+    }));
+
+    res.json({ success: true, data: formattedStudents });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Error retrieving students report: ' + err.message });
@@ -32,22 +65,26 @@ exports.getStudentsReport = async (req, res) => {
 exports.getLedgerReport = async (req, res) => {
   try {
     const { month, year } = req.query;
-    let query = `SELECT id, date, type, category, title, amount, description, payment_method, reference_no 
-                 FROM accounts_ledger 
-                 WHERE 1=1`;
-    const params = [];
-    if (year) {
-      query += ` AND YEAR(date) = ?`;
-      params.push(parseInt(year));
-    }
-    if (month) {
-      query += ` AND MONTH(date) = ?`;
-      params.push(parseInt(month));
-    }
-    query += ` ORDER BY date DESC`;
+    const filter = {};
 
-    const [ledger] = await db.query(query, params);
-    res.json({ success: true, data: ledger });
+    const dateFilter = getDateRangeFilter(year, month, 'date');
+    Object.assign(filter, dateFilter);
+
+    const ledger = await AccountsLedger.find(filter).sort({ date: -1 });
+
+    const formattedLedger = ledger.map(entry => ({
+      id: entry._id.toString(),
+      date: entry.date,
+      type: entry.type,
+      category: entry.category,
+      title: entry.title,
+      amount: entry.amount,
+      description: entry.description || '',
+      payment_method: entry.payment_method || 'Cash',
+      reference_no: entry.reference || ''
+    }));
+
+    res.json({ success: true, data: formattedLedger });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Error retrieving ledger report: ' + err.message });
@@ -58,27 +95,35 @@ exports.getLedgerReport = async (req, res) => {
 exports.exportStudentsExcel = async (req, res) => {
   try {
     const { month, year } = req.query;
-    let query = `SELECT roll_number as 'Roll Number', admission_no as 'Admission No', name as 'Name', 
-                        email as 'Email', phone as 'Phone', class_name as 'Class', section_name as 'Section', 
-                        gender as 'Gender', dob as 'DOB', blood_group as 'Blood Group', father_name as 'Father Name',
-                        admission_date as 'Admission Date'
-                 FROM view_student_profiles 
-                 WHERE user_status = "active"`;
-    const params = [];
-    if (year) {
-      query += ` AND YEAR(admission_date) = ?`;
-      params.push(parseInt(year));
-    }
-    if (month) {
-      query += ` AND MONTH(admission_date) = ?`;
-      params.push(parseInt(month));
-    }
-    query += ` ORDER BY admission_date DESC`;
+    const filter = { status: 'active' };
 
-    const [students] = await db.query(query, params);
+    const dateFilter = getDateRangeFilter(year, month, 'admission_date');
+    Object.assign(filter, dateFilter);
+
+    const students = await Student.find(filter)
+      .populate('user', 'name email phone')
+      .populate('class', 'name')
+      .populate('section', 'name')
+      .populate('parent')
+      .sort({ admission_date: -1 });
+
+    const data = students.map(student => ({
+      'Roll Number': student.roll_number,
+      'Admission No': student.admission_number,
+      'Name': student.user ? student.user.name : '',
+      'Email': student.user ? student.user.email : '',
+      'Phone': student.user ? student.user.phone : '',
+      'Class': student.class ? student.class.name : '',
+      'Section': student.section ? student.section.name : '',
+      'Gender': student.gender || '',
+      'DOB': student.dob ? new Date(student.dob).toLocaleDateString() : '',
+      'Blood Group': student.blood_group || '',
+      'Father Name': student.parent ? student.parent.father_name : '',
+      'Admission Date': student.admission_date ? new Date(student.admission_date).toLocaleDateString() : ''
+    }));
 
     const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(students);
+    const ws = XLSX.utils.json_to_sheet(data);
     XLSX.utils.book_append_sheet(wb, ws, 'Active Students');
     
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -96,25 +141,26 @@ exports.exportStudentsExcel = async (req, res) => {
 exports.exportLedgerExcel = async (req, res) => {
   try {
     const { month, year } = req.query;
-    let query = `SELECT date as 'Date', type as 'Type', category as 'Category', title as 'Title', 
-                        amount as 'Amount', description as 'Description', payment_method as 'Payment Method', reference_no as 'Ref No'
-                 FROM accounts_ledger 
-                 WHERE 1=1`;
-    const params = [];
-    if (year) {
-      query += ` AND YEAR(date) = ?`;
-      params.push(parseInt(year));
-    }
-    if (month) {
-      query += ` AND MONTH(date) = ?`;
-      params.push(parseInt(month));
-    }
-    query += ` ORDER BY date DESC`;
+    const filter = {};
 
-    const [ledger] = await db.query(query, params);
+    const dateFilter = getDateRangeFilter(year, month, 'date');
+    Object.assign(filter, dateFilter);
+
+    const ledger = await AccountsLedger.find(filter).sort({ date: -1 });
+
+    const data = ledger.map(entry => ({
+      'Date': entry.date ? new Date(entry.date).toLocaleDateString() : '',
+      'Type': entry.type,
+      'Category': entry.category,
+      'Title': entry.title,
+      'Amount': entry.amount,
+      'Description': entry.description || '',
+      'Payment Method': entry.payment_method || 'Cash',
+      'Ref No': entry.reference || ''
+    }));
 
     const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(ledger);
+    const ws = XLSX.utils.json_to_sheet(data);
     XLSX.utils.book_append_sheet(wb, ws, 'Financial Ledger');
 
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -132,38 +178,24 @@ exports.exportLedgerExcel = async (req, res) => {
 exports.exportInvoicePDF = async (req, res) => {
   const { invoiceId } = req.params;
   try {
-    const [invoices] = await db.query(
-      `SELECT fi.*, u.name as student_name, s.roll_number, c.name as class_name, sec.name as section_name,
-              p.father_name, p.father_phone
-       FROM fee_invoices fi
-       JOIN students s ON fi.student_id = s.id
-       JOIN users u ON s.user_id = u.id
-       JOIN classes c ON s.class_id = c.id
-       JOIN sections sec ON s.section_id = sec.id
-       LEFT JOIN parents p ON s.parent_id = p.id
-       WHERE fi.id = ?`,
-      [invoiceId]
-    );
+    const invoice = await FeeInvoice.findById(invoiceId)
+      .populate({
+        path: 'student',
+        populate: [
+          { path: 'user', select: 'name' },
+          { path: 'class', select: 'name' },
+          { path: 'section', select: 'name' },
+          { path: 'parent' }
+        ]
+      });
 
-    if (invoices.length === 0) {
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found' });
     }
 
-    const invoice = invoices[0];
-
-    // Fetch details
-    const [details] = await db.query(
-      `SELECT fid.*, ft.name as fee_name 
-       FROM fee_invoice_details fid
-       JOIN fee_types ft ON fid.fee_type_id = ft.id
-       WHERE fid.invoice_id = ?`,
-      [invoiceId]
-    );
-
-    // Create PDF
     const doc = new PDFDocument({ margin: 50 });
 
-    res.setHeader('Content-Disposition', `attachment; filename="Invoice_${invoice.invoice_no}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="Invoice_${invoice.invoice_number}.pdf"`);
     res.type('application/pdf');
     doc.pipe(res);
 
@@ -177,18 +209,18 @@ exports.exportInvoicePDF = async (req, res) => {
     doc.fontSize(14).text('FEE RECEIPT / INVOICE', { underline: true });
     doc.moveDown(1);
     doc.fontSize(10);
-    doc.text(`Invoice No: ${invoice.invoice_no}`);
-    doc.text(`Date: ${new Date(invoice.date).toLocaleDateString()}`);
+    doc.text(`Invoice No: ${invoice.invoice_number}`);
+    doc.text(`Date: ${new Date(invoice.issue_date).toLocaleDateString()}`);
     doc.text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString()}`);
     doc.text(`Status: ${invoice.status.toUpperCase()}`);
     doc.moveDown(1);
 
     // Student Info
-    doc.text(`Student Name: ${invoice.student_name}`);
-    doc.text(`Roll Number: ${invoice.roll_number}`);
-    doc.text(`Class: ${invoice.class_name} - ${invoice.section_name}`);
-    if (invoice.father_name) {
-      doc.text(`Guardian Name: ${invoice.father_name}`);
+    doc.text(`Student Name: ${invoice.student && invoice.student.user ? invoice.student.user.name : ''}`);
+    doc.text(`Roll Number: ${invoice.student ? invoice.student.roll_number : ''}`);
+    doc.text(`Class: ${invoice.student && invoice.student.class ? invoice.student.class.name : ''} - ${invoice.student && invoice.student.section ? invoice.student.section.name : ''}`);
+    if (invoice.student && invoice.student.parent && invoice.student.parent.father_name) {
+      doc.text(`Guardian Name: ${invoice.student.parent.father_name}`);
     }
     doc.moveDown(2);
 
@@ -201,8 +233,8 @@ exports.exportInvoicePDF = async (req, res) => {
 
     // Table Body
     doc.fontSize(10);
-    details.forEach(item => {
-      doc.text(item.fee_name, 50, doc.y);
+    invoice.items.forEach(item => {
+      doc.text(item.fee_type, 50, doc.y);
       doc.text(parseFloat(item.amount).toFixed(2), 400, doc.y);
       doc.moveDown(0.5);
     });
@@ -212,13 +244,13 @@ exports.exportInvoicePDF = async (req, res) => {
 
     // Totals
     doc.text('Total Invoice Amount:', 250, doc.y);
-    doc.text(parseFloat(invoice.total_amount).toFixed(2), 400, doc.y);
+    doc.text(parseFloat(invoice.total).toFixed(2), 400, doc.y);
     doc.moveDown(0.5);
     doc.text('Total Paid Amount:', 250, doc.y);
-    doc.text(parseFloat(invoice.paid_amount).toFixed(2), 400, doc.y);
+    doc.text(parseFloat(invoice.paid_amount || 0).toFixed(2), 400, doc.y);
     doc.moveDown(0.5);
     
-    const balance = parseFloat(invoice.total_amount) - parseFloat(invoice.paid_amount);
+    const balance = parseFloat(invoice.total) - parseFloat(invoice.paid_amount || 0);
     doc.fontSize(11).text('Balance Due:', 250, doc.y, { bold: true });
     doc.text(balance.toFixed(2), 400, doc.y, { bold: true });
 

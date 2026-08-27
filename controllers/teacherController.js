@@ -1,4 +1,6 @@
-const db = require('../config/db');
+const Teacher = require('../models/Teacher');
+const User = require('../models/User');
+const ClassSubject = require('../models/ClassSubject');
 const bcrypt = require('bcryptjs');
 
 // Get all teachers
@@ -7,28 +9,52 @@ exports.getTeachers = async (req, res) => {
   const status = req.query.status || 'active';
 
   try {
-    let query = `
-      SELECT *
-      FROM view_teacher_profiles
-      WHERE 1=1
-    `;
-    const params = [];
+    const filter = {};
 
     if (status) {
-      query += ' AND user_status = ?';
-      params.push(status);
+      filter.status = status;
     }
 
     if (search) {
-      query += ' AND (name LIKE ? OR employee_id LIKE ? OR email LIKE ?)';
-      const searchWild = `%${search}%`;
-      params.push(searchWild, searchWild, searchWild);
+      // Find users matching search by name or email
+      const usersMatchingSearch = await User.find({
+        $or: [
+          { name: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } }
+        ]
+      });
+      const userIds = usersMatchingSearch.map(u => u._id);
+
+      // Filter teachers by user ID or employee ID
+      filter.$or = [
+        { user: { $in: userIds } },
+        { employee_id: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    query += ' ORDER BY id DESC';
+    const teachers = await Teacher.find(filter)
+      .populate('user', 'name email phone avatar status')
+      .sort({ created_at: -1 });
 
-    const [teachers] = await db.query(query, params);
-    res.json({ teachers });
+    // Format like MySQL view_teacher_profiles
+    const formattedTeachers = teachers.map(teacher => ({
+      id: teacher._id.toString(),
+      user_id: teacher.user ? teacher.user._id.toString() : null,
+      name: teacher.user ? teacher.user.name : '',
+      email: teacher.user ? teacher.user.email : '',
+      phone: teacher.user ? teacher.user.phone : '',
+      avatar: teacher.user ? teacher.user.avatar : '',
+      employee_id: teacher.employee_id || '',
+      designation: teacher.designation || '',
+      department: teacher.department || '',
+      qualification: teacher.qualification || '',
+      experience: teacher.experience || '',
+      salary: teacher.salary || 0,
+      hire_date: teacher.joining_date,
+      user_status: teacher.user ? teacher.user.status : 'inactive'
+    }));
+
+    res.json({ teachers: formattedTeachers });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching teachers' });
@@ -39,28 +65,44 @@ exports.getTeachers = async (req, res) => {
 exports.getTeacherById = async (req, res) => {
   const { id } = req.params;
   try {
-    const [teachers] = await db.query(
-      `SELECT * FROM view_teacher_profiles WHERE id = ?`,
-      [id]
-    );
-
-    if (teachers.length === 0) {
+    const teacher = await Teacher.findById(id).populate('user', 'name email phone avatar status');
+    if (!teacher) {
       return res.status(404).json({ message: 'Teacher not found' });
     }
 
     // Fetch classes taught by this teacher
-    const [classes] = await db.query(
-      `SELECT cs.id AS mapping_id, c.name AS class_name, s.name AS section_name, sub.name AS subject_name, sub.code AS subject_code
-       FROM class_subjects cs
-       JOIN classes c ON cs.class_id = c.id
-       JOIN sections s ON cs.section_id = s.id
-       JOIN subjects sub ON cs.subject_id = sub.id
-       WHERE cs.teacher_id = ?`,
-      [teachers[0].user_id]
-    );
+    const classSubjects = await ClassSubject.find({ teacher: teacher._id })
+      .populate('class', 'name')
+      .populate('section', 'name')
+      .populate('subject', 'name code');
+
+    const classes = classSubjects.map(cs => ({
+      mapping_id: cs._id.toString(),
+      class_name: cs.class ? cs.class.name : '',
+      section_name: cs.section ? cs.section.name : '',
+      subject_name: cs.subject ? cs.subject.name : '',
+      subject_code: cs.subject ? cs.subject.code : ''
+    }));
+
+    const formattedTeacher = {
+      id: teacher._id.toString(),
+      user_id: teacher.user ? teacher.user._id.toString() : null,
+      name: teacher.user ? teacher.user.name : '',
+      email: teacher.user ? teacher.user.email : '',
+      phone: teacher.user ? teacher.user.phone : '',
+      avatar: teacher.user ? teacher.user.avatar : '',
+      employee_id: teacher.employee_id || '',
+      designation: teacher.designation || '',
+      department: teacher.department || '',
+      qualification: teacher.qualification || '',
+      experience: teacher.experience || '',
+      salary: teacher.salary || 0,
+      hire_date: teacher.joining_date,
+      user_status: teacher.user ? teacher.user.status : 'inactive'
+    };
 
     res.json({
-      teacher: teachers[0],
+      teacher: formattedTeacher,
       classes
     });
   } catch (err) {
@@ -76,33 +118,37 @@ exports.createTeacher = async (req, res) => {
     department, qualification, experience, salary, hire_date
   } = req.body;
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
     // 1. Create User
     const hashedPassword = await bcrypt.hash(password || 'teacher123', 10);
-    const [userResult] = await conn.query(
-      'INSERT INTO users (name, email, password, role, phone, status) VALUES (?, ?, ?, ?, ?, ?)',
-      [name, email, hashedPassword, 'teacher', phone, 'active']
-    );
-    const userId = userResult.insertId;
+    const newUser = new User({
+      name,
+      email,
+      password: hashedPassword,
+      role: 'teacher',
+      phone,
+      status: 'active'
+    });
+    await newUser.save();
 
     // 2. Create Teacher Profile
-    await conn.query(
-      `INSERT INTO teachers (user_id, employee_id, designation, department, qualification, experience, salary, hire_date, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [userId, employee_id || `EMP-${Date.now()}`, designation, department, qualification, experience, salary || 0.00, hire_date || new Date().toISOString().slice(0,10), 'active']
-    );
+    const newTeacher = new Teacher({
+      user: newUser._id,
+      employee_id: employee_id || `EMP-${Date.now()}`,
+      designation,
+      department,
+      qualification,
+      experience,
+      salary: salary || 0,
+      joining_date: hire_date || new Date(),
+      status: 'active'
+    });
+    await newTeacher.save();
 
-    await conn.commit();
     res.status(201).json({ message: 'Teacher registered successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error registering teacher: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -114,45 +160,34 @@ exports.updateTeacher = async (req, res) => {
     experience, salary, hire_date, status
   } = req.body;
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    const [teacher] = await conn.query('SELECT user_id FROM teachers WHERE id = ?', [id]);
-    if (teacher.length === 0) {
+    const teacher = await Teacher.findById(id);
+    if (!teacher) {
       return res.status(404).json({ message: 'Teacher not found' });
     }
-    const userId = teacher[0].user_id;
 
     // Update User
-    await conn.query(
-      'UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?',
-      [name, email, phone, userId]
-    );
+    await User.findByIdAndUpdate(teacher.user, {
+      name,
+      email,
+      phone,
+      status: status || 'active'
+    });
 
     // Update Teacher
-    await conn.query(
-      `UPDATE teachers 
-       SET designation = ?, department = ?, qualification = ?, experience = ?, salary = ?, hire_date = ?, status = ?
-       WHERE id = ?`,
-      [designation, department, qualification, experience, salary, hire_date, status || 'active', id]
-    );
+    teacher.designation = designation;
+    teacher.department = department;
+    teacher.qualification = qualification;
+    teacher.experience = experience;
+    teacher.salary = salary;
+    teacher.joining_date = hire_date;
+    teacher.status = status || 'active';
+    await teacher.save();
 
-    // Update User Status
-    if (status === 'inactive') {
-      await conn.query('UPDATE users SET status = "inactive" WHERE id = ?', [userId]);
-    } else {
-      await conn.query('UPDATE users SET status = "active" WHERE id = ?', [userId]);
-    }
-
-    await conn.commit();
     res.json({ message: 'Teacher updated successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error updating teacher' });
-  } finally {
-    conn.release();
   }
 };
 
@@ -160,13 +195,14 @@ exports.updateTeacher = async (req, res) => {
 exports.deleteTeacher = async (req, res) => {
   const { id } = req.params;
   try {
-    const [teacher] = await db.query('SELECT user_id FROM teachers WHERE id = ?', [id]);
-    if (teacher.length === 0) {
+    const teacher = await Teacher.findById(id);
+    if (!teacher) {
       return res.status(404).json({ message: 'Teacher not found' });
     }
 
-    await db.query('UPDATE users SET status = "inactive" WHERE id = ?', [teacher[0].user_id]);
-    await db.query('UPDATE teachers SET status = "inactive" WHERE id = ?', [id]);
+    await User.findByIdAndUpdate(teacher.user, { status: 'inactive' });
+    teacher.status = 'inactive';
+    await teacher.save();
 
     res.json({ message: 'Teacher set to inactive successfully' });
   } catch (err) {

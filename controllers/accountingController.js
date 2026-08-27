@@ -1,33 +1,41 @@
-const db = require('../config/db');
+const AccountsLedger = require('../models/AccountsLedger');
 
 // Get all ledger entries
 exports.getLedger = async (req, res) => {
   const { type, category, startDate, endDate } = req.query;
   try {
-    let query = 'SELECT * FROM accounts_ledger WHERE 1=1';
-    const params = [];
+    const filter = {};
 
     if (type) {
-      query += ' AND type = ?';
-      params.push(type);
+      filter.type = type;
     }
     if (category) {
-      query += ' AND category = ?';
-      params.push(category);
+      filter.category = category;
     }
     if (startDate) {
-      query += ' AND date >= ?';
-      params.push(startDate);
+      filter.date = filter.date || {};
+      filter.date.$gte = new Date(startDate);
     }
     if (endDate) {
-      query += ' AND date <= ?';
-      params.push(endDate);
+      filter.date = filter.date || {};
+      filter.date.$lte = new Date(endDate);
     }
 
-    query += ' ORDER BY date DESC, id DESC';
+    const ledger = await AccountsLedger.find(filter).sort({ date: -1, created_at: -1 });
 
-    const [ledger] = await db.query(query, params);
-    res.json({ ledger });
+    const formattedLedger = ledger.map(entry => ({
+      id: entry._id.toString(),
+      type: entry.type,
+      category: entry.category,
+      title: entry.title,
+      description: entry.description || '',
+      amount: entry.amount,
+      date: entry.date,
+      reference_no: entry.reference || '',
+      file_path: entry.file_path || ''
+    }));
+
+    res.json({ ledger: formattedLedger });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching ledger' });
@@ -42,11 +50,18 @@ exports.createLedgerEntry = async (req, res) => {
   }
 
   try {
-    await db.query(
-      `INSERT INTO accounts_ledger (type, category, title, amount, date, description, payment_method, reference_no) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [type, category, title, amount, date, description || '', payment_method || 'Cash', reference_no || '']
-    );
+    const newEntry = new AccountsLedger({
+      type,
+      category,
+      title,
+      amount: parseFloat(amount),
+      date: new Date(date),
+      description: description || '',
+      reference: reference_no || '',
+      file_path: '' // empty by default
+    });
+    await newEntry.save();
+
     res.status(201).json({ message: 'Ledger entry recorded successfully' });
   } catch (err) {
     console.error(err);
@@ -58,25 +73,51 @@ exports.createLedgerEntry = async (req, res) => {
 exports.getFinancialSummary = async (req, res) => {
   try {
     // Total income
-    const [incomeResult] = await db.query('SELECT SUM(amount) as total FROM accounts_ledger WHERE type = "Income"');
-    const totalIncome = parseFloat(incomeResult[0].total || 0);
+    const incomeResult = await AccountsLedger.aggregate([
+      { $match: { type: 'Income' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const totalIncome = incomeResult.length > 0 ? incomeResult[0].total : 0;
 
     // Total expenses
-    const [expenseResult] = await db.query('SELECT SUM(amount) as total FROM accounts_ledger WHERE type = "Expense"');
-    const totalExpense = parseFloat(expenseResult[0].total || 0);
+    const expenseResult = await AccountsLedger.aggregate([
+      { $match: { type: 'Expense' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const totalExpense = expenseResult.length > 0 ? expenseResult[0].total : 0;
 
     // Group by Category
-    const [categoryGroup] = await db.query(
-      'SELECT type, category, SUM(amount) as total FROM accounts_ledger GROUP BY type, category'
-    );
+    const categoryGroupRaw = await AccountsLedger.aggregate([
+      { $group: { _id: { type: '$type', category: '$category' }, total: { $sum: '$amount' } } }
+    ]);
+    const categoryGroup = categoryGroupRaw.map(item => ({
+      type: item._id.type,
+      category: item._id.category,
+      total: item.total
+    }));
 
-    // Monthly income vs expense for chart
-    const [monthlyStats] = await db.query(
-      `SELECT type, MONTH(date) as month, SUM(amount) as total 
-       FROM accounts_ledger 
-       WHERE YEAR(date) = YEAR(CURDATE()) 
-       GROUP BY type, MONTH(date)`
-    );
+    // Monthly income vs expense for chart (Current Year)
+    const currentYear = new Date().getFullYear();
+    const startOfYear = new Date(Date.UTC(currentYear, 0, 1, 0, 0, 0, 0));
+    const endOfYear = new Date(Date.UTC(currentYear, 11, 31, 23, 59, 59, 999));
+
+    const monthlyStatsRaw = await AccountsLedger.aggregate([
+      { $match: { date: { $gte: startOfYear, $lte: endOfYear } } },
+      {
+        $group: {
+          _id: {
+            type: '$type',
+            month: { $month: '$date' }
+          },
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+    const monthlyStats = monthlyStatsRaw.map(item => ({
+      type: item._id.type,
+      month: item._id.month,
+      total: item.total
+    }));
 
     res.json({
       summary: {

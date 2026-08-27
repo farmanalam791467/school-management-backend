@@ -1,58 +1,85 @@
-const db = require('../config/db');
+const Student = require('../models/Student');
+const User = require('../models/User');
+const Parent = require('../models/Parent');
+const Class = require('../models/Class');
+const Section = require('../models/Section');
 const bcrypt = require('bcryptjs');
 
 // Get all students with pagination, search, and class filtering
 exports.getStudents = async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
-  const offset = (page - 1) * limit;
+  const skip = (page - 1) * limit;
   const search = req.query.search || '';
   const classId = req.query.classId || '';
   const sectionId = req.query.sectionId || '';
   const status = req.query.status || 'active';
 
   try {
-    let countQuery = 'SELECT COUNT(*) as total FROM view_student_profiles WHERE 1=1';
-    let dataQuery = 'SELECT * FROM view_student_profiles WHERE 1=1';
-    const queryParams = [];
+    const filter = {};
 
     if (status) {
-      countQuery += ' AND user_status = ?';
-      dataQuery += ' AND user_status = ?';
-      queryParams.push(status);
+      filter.status = status;
     }
 
     if (classId) {
-      countQuery += ' AND class_name = (SELECT name FROM classes WHERE id = ?)';
-      dataQuery += ' AND class_name = (SELECT name FROM classes WHERE id = ?)';
-      queryParams.push(classId);
+      filter.class = classId;
     }
 
     if (sectionId) {
-      countQuery += ' AND section_name = (SELECT name FROM sections WHERE id = ?)';
-      dataQuery += ' AND section_name = (SELECT name FROM sections WHERE id = ?)';
-      queryParams.push(sectionId);
+      filter.section = sectionId;
     }
 
     if (search) {
-      countQuery += ' AND (name LIKE ? OR roll_number LIKE ? OR admission_no LIKE ? OR email LIKE ?)';
-      dataQuery += ' AND (name LIKE ? OR roll_number LIKE ? OR admission_no LIKE ? OR email LIKE ?)';
-      const searchWild = `%${search}%`;
-      queryParams.push(searchWild, searchWild, searchWild, searchWild);
+      // Find users matching search by name or email
+      const usersMatchingSearch = await User.find({
+        $or: [
+          { name: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } }
+        ]
+      });
+      const userIds = usersMatchingSearch.map(u => u._id);
+
+      // Filter students by user ID or roll number or admission number
+      filter.$or = [
+        { user: { $in: userIds } },
+        { roll_number: { $regex: search, $options: 'i' } },
+        { admission_number: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    // Get total count
-    const [counts] = await db.query(countQuery, queryParams);
-    const total = counts[0].total;
+    const total = await Student.countDocuments(filter);
+    
+    const students = await Student.find(filter)
+      .populate('user', 'name email phone avatar status')
+      .populate('class', 'name')
+      .populate('section', 'name')
+      .populate({
+        path: 'parent',
+        populate: { path: 'user', select: 'name email phone' }
+      })
+      .sort({ created_at: -1 })
+      .skip(skip)
+      .limit(limit);
 
-    // Add pagination to data query
-    dataQuery += ' ORDER BY student_id DESC LIMIT ? OFFSET ?';
-    queryParams.push(limit, offset);
-
-    const [students] = await db.query(dataQuery, queryParams);
+    // Map to flat structure like MySQL view_student_profiles
+    const formattedStudents = students.map(student => ({
+      student_id: student._id.toString(),
+      user_id: student.user ? student.user._id.toString() : null,
+      name: student.user ? student.user.name : '',
+      email: student.user ? student.user.email : '',
+      phone: student.user ? student.user.phone : '',
+      roll_number: student.roll_number,
+      admission_no: student.admission_number,
+      class_name: student.class ? student.class.name : '',
+      section_name: student.section ? student.section.name : '',
+      user_status: student.user ? student.user.status : 'inactive',
+      father_name: student.parent ? student.parent.father_name : '',
+      father_phone: student.parent ? student.parent.father_phone : ''
+    }));
 
     res.json({
-      students,
+      students: formattedStudents,
       pagination: {
         total,
         page,
@@ -70,18 +97,37 @@ exports.getStudents = async (req, res) => {
 exports.getStudentById = async (req, res) => {
   const { id } = req.params;
   try {
-    const [students] = await db.query('SELECT * FROM view_student_profiles WHERE student_id = ?', [id]);
-    if (students.length === 0) {
+    const student = await Student.findById(id)
+      .populate('user', 'name email phone avatar')
+      .populate('class')
+      .populate('section')
+      .populate('parent');
+
+    if (!student) {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    // Get detailed record
-    const [studentDetails] = await db.query('SELECT * FROM students WHERE id = ?', [id]);
-    const [userDetails] = await db.query('SELECT name, email, phone, avatar FROM users WHERE id = ?', [studentDetails[0].user_id]);
-
     res.json({
-      student: studentDetails[0],
-      user: userDetails[0]
+      student: {
+        id: student._id.toString(),
+        user_id: student.user ? student.user._id.toString() : null,
+        parent_id: student.parent ? student.parent._id.toString() : null,
+        roll_number: student.roll_number,
+        admission_no: student.admission_number,
+        admission_date: student.admission_date,
+        class_id: student.class ? student.class._id.toString() : null,
+        section_id: student.section ? student.section._id.toString() : null,
+        gender: student.gender,
+        dob: student.dob,
+        blood_group: student.blood_group,
+        status: student.status
+      },
+      user: {
+        name: student.user ? student.user.name : '',
+        email: student.user ? student.user.email : '',
+        phone: student.user ? student.user.phone : '',
+        avatar: student.user ? student.user.avatar : ''
+      }
     });
   } catch (err) {
     console.error(err);
@@ -97,54 +143,71 @@ exports.createStudent = async (req, res) => {
     father_name, father_phone, father_occupation, mother_name, mother_phone, mother_occupation, address
   } = req.body;
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
     // 1. Create User
     const hashedPassword = await bcrypt.hash(password || 'student123', 10);
-    const [userResult] = await conn.query(
-      'INSERT INTO users (name, email, password, role, phone, status) VALUES (?, ?, ?, ?, ?, ?)',
-      [name, email, hashedPassword, 'student', phone, 'active']
-    );
-    const userId = userResult.insertId;
+    const newUser = new User({
+      name,
+      email,
+      password: hashedPassword,
+      role: 'student',
+      phone,
+      status: 'active'
+    });
+    await newUser.save();
 
-    // 2. Handle Parent (Create parent user and parent profile if it's new, otherwise link)
+    // 2. Handle Parent (Create parent user and parent profile if it's new)
     let parentId = null;
     if (father_name) {
-      const parentEmail = `parent_${roll_number}@eskooly.com`; // auto-generated unique parent email if not provided
+      const parentEmail = `parent_${roll_number || Date.now()}@eskooly.com`;
       const parentPassword = await bcrypt.hash('parent123', 10);
       
-      const [parentUserResult] = await conn.query(
-        'INSERT INTO users (name, email, password, role, phone, status) VALUES (?, ?, ?, ?, ?, ?)',
-        [father_name, parentEmail, parentPassword, 'parent', father_phone, 'active']
-      );
-      const parentUserId = parentUserResult.insertId;
+      const newParentUser = new User({
+        name: father_name,
+        email: parentEmail,
+        password: parentPassword,
+        role: 'parent',
+        phone: father_phone,
+        status: 'active'
+      });
+      await newParentUser.save();
 
-      const [parentProfileResult] = await conn.query(
-        `INSERT INTO parents (user_id, father_name, father_phone, father_occupation, mother_name, mother_phone, mother_occupation, address)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [parentUserId, father_name, father_phone, father_occupation, mother_name, mother_phone, mother_occupation, address]
-      );
-      parentId = parentProfileResult.insertId;
+      const newParent = new Parent({
+        user: newParentUser._id,
+        father_name,
+        father_phone,
+        father_occupation,
+        mother_name,
+        mother_phone,
+        mother_occupation,
+        address
+      });
+      await newParent.save();
+      parentId = newParent._id;
     }
 
     // 3. Create Student
-    const admissionDate = new Date().toISOString().slice(0, 10);
-    await conn.query(
-      `INSERT INTO students (user_id, parent_id, roll_number, admission_no, admission_date, class_id, section_id, gender, dob, blood_group, medical_history, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [userId, parentId, roll_number, admission_no || `ADM-${Date.now()}`, admissionDate, class_id, section_id, gender, dob, blood_group, medical_history, 'active']
-    );
+    const admissionDate = new Date();
+    const newStudent = new Student({
+      user: newUser._id,
+      parent: parentId,
+      roll_number,
+      admission_number: admission_no || `ADM-${Date.now()}`,
+      admission_date: admissionDate,
+      class: class_id,
+      section: section_id,
+      gender,
+      dob,
+      blood_group,
+      medical_history,
+      status: 'active'
+    });
+    await newStudent.save();
 
-    await conn.commit();
     res.status(201).json({ message: 'Student admitted successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error during admission: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -156,45 +219,36 @@ exports.updateStudent = async (req, res) => {
     blood_group, medical_history, status, photo
   } = req.body;
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    const [student] = await conn.query('SELECT user_id FROM students WHERE id = ?', [id]);
-    if (student.length === 0) {
+    const student = await Student.findById(id);
+    if (!student) {
       return res.status(404).json({ message: 'Student not found' });
     }
-    const userId = student[0].user_id;
 
     // Update User
-    await conn.query(
-      'UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?',
-      [name, email, phone, userId]
-    );
+    await User.findByIdAndUpdate(student.user, {
+      name,
+      email,
+      phone,
+      status: status || 'active'
+    });
 
     // Update Student
-    await conn.query(
-      `UPDATE students 
-       SET roll_number = ?, class_id = ?, section_id = ?, gender = ?, dob = ?, blood_group = ?, medical_history = ?, status = ?, photo = ?
-       WHERE id = ?`,
-      [roll_number, class_id, section_id, gender, dob, blood_group, medical_history, status || 'active', photo || null, id]
-    );
+    student.roll_number = roll_number;
+    student.class = class_id;
+    student.section = section_id;
+    student.gender = gender;
+    student.dob = dob;
+    student.blood_group = blood_group;
+    student.medical_history = medical_history;
+    student.status = status || 'active';
+    student.photo = photo || null;
+    await student.save();
 
-    // Also sync user status
-    if (status === 'inactive') {
-      await conn.query('UPDATE users SET status = "inactive" WHERE id = ?', [userId]);
-    } else {
-      await conn.query('UPDATE users SET status = "active" WHERE id = ?', [userId]);
-    }
-
-    await conn.commit();
     res.json({ message: 'Student updated successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error updating student' });
-  } finally {
-    conn.release();
   }
 };
 
@@ -205,26 +259,15 @@ exports.promoteStudents = async (req, res) => {
     return res.status(400).json({ message: 'Invalid promotion data' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    for (const studentId of studentIds) {
-      // Update student's class and section
-      await conn.query(
-        'UPDATE students SET class_id = ?, section_id = ?, status = "active" WHERE id = ?',
-        [targetClassId, targetSectionId, studentId]
-      );
-    }
-
-    await conn.commit();
+    await Student.updateMany(
+      { _id: { $in: studentIds } },
+      { class: targetClassId, section: targetSectionId, status: 'active' }
+    );
     res.json({ message: `${studentIds.length} students promoted successfully` });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error promoting students' });
-  } finally {
-    conn.release();
   }
 };
 
@@ -232,14 +275,14 @@ exports.promoteStudents = async (req, res) => {
 exports.deleteStudent = async (req, res) => {
   const { id } = req.params;
   try {
-    const [student] = await db.query('SELECT user_id FROM students WHERE id = ?', [id]);
-    if (student.length === 0) {
+    const student = await Student.findById(id);
+    if (!student) {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    // Set user and student status to inactive
-    await db.query('UPDATE users SET status = "inactive" WHERE id = ?', [student[0].user_id]);
-    await db.query('UPDATE students SET status = "inactive" WHERE id = ?', [id]);
+    await User.findByIdAndUpdate(student.user, { status: 'inactive' });
+    student.status = 'inactive';
+    await student.save();
 
     res.json({ message: 'Student set to inactive successfully' });
   } catch (err) {

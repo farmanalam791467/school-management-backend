@@ -1,4 +1,9 @@
-const db = require('../config/db');
+const Exam = require('../models/Exam');
+const ExamMark = require('../models/ExamMark');
+const Student = require('../models/Student');
+const User = require('../models/User');
+const Subject = require('../models/Subject');
+const Grade = require('../models/Grade');
 
 // ==========================================================
 // ONLINE EXAMS
@@ -8,21 +13,26 @@ const db = require('../config/db');
 exports.getExams = async (req, res) => {
   const { classId, type } = req.query;
   try {
-    let query = 'SELECT e.*, c.name as class_name FROM exams e JOIN classes c ON e.class_id = c.id WHERE 1=1';
-    const params = [];
+    const filter = {};
+    if (classId) filter.class = classId;
+    if (type) filter.type = type;
 
-    if (classId) {
-      query += ' AND e.class_id = ?';
-      params.push(classId);
-    }
-    if (type) {
-      query += ' AND e.type = ?';
-      params.push(type);
-    }
+    const exams = await Exam.find(filter).populate('class', 'name').sort({ created_at: -1 });
 
-    query += ' ORDER BY e.id DESC';
-    const [exams] = await db.query(query, params);
-    res.json({ exams });
+    const formattedExams = exams.map(e => ({
+      id: e._id.toString(),
+      name: e.name,
+      type: e.type,
+      class_id: e.class ? e.class._id.toString() : null,
+      class_name: e.class ? e.class.name : '',
+      start_date: e.start_date,
+      end_date: e.end_date,
+      total_marks: e.total_marks,
+      passing_marks: e.passing_marks,
+      status: e.status
+    }));
+
+    res.json({ exams: formattedExams });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching exams' });
@@ -37,12 +47,18 @@ exports.createExam = async (req, res) => {
   }
 
   try {
-    const [result] = await db.query(
-      `INSERT INTO exams (name, type, class_id, start_date, end_date, total_marks, passing_marks) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [name, type, class_id, start_date, end_date, total_marks, passing_marks]
-    );
-    res.status(201).json({ message: 'Exam created successfully', examId: result.insertId });
+    const newExam = new Exam({
+      name,
+      type,
+      class: class_id,
+      start_date: new Date(start_date),
+      end_date: new Date(end_date),
+      total_marks: parseFloat(total_marks),
+      passing_marks: parseFloat(passing_marks),
+      status: 'scheduled'
+    });
+    await newExam.save();
+    res.status(201).json({ message: 'Exam created successfully', examId: newExam._id.toString() });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error creating exam' });
@@ -56,26 +72,31 @@ exports.addQuestions = async (req, res) => {
     return res.status(400).json({ message: 'Exam ID and questions list are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    for (const q of questions) {
-      await conn.query(
-        `INSERT INTO exam_questions (exam_id, question_text, type, option_a, option_b, option_c, option_d, correct_option, marks, negative_marks) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [exam_id, q.question_text, q.type || 'MCQ', q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, q.marks, q.negative_marks || 0.00]
-      );
+    const exam = await Exam.findById(exam_id);
+    if (!exam) {
+      return res.status(404).json({ message: 'Exam not found' });
     }
 
-    await conn.commit();
+    for (const q of questions) {
+      exam.questions.push({
+        question_text: q.question_text,
+        type: q.type || 'MCQ',
+        option_a: q.option_a,
+        option_b: q.option_b,
+        option_c: q.option_c,
+        option_d: q.option_d,
+        correct_option: q.correct_option,
+        marks: parseFloat(q.marks || 1),
+        negative_marks: parseFloat(q.negative_marks || 0)
+      });
+    }
+
+    await exam.save();
     res.json({ message: 'Questions added successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error adding questions' });
-  } finally {
-    conn.release();
   }
 };
 
@@ -83,19 +104,45 @@ exports.addQuestions = async (req, res) => {
 exports.getExamQuestions = async (req, res) => {
   const { examId } = req.params;
   try {
-    const [exams] = await db.query('SELECT * FROM exams WHERE id = ?', [examId]);
-    if (exams.length === 0) {
+    const exam = await Exam.findById(examId).populate('class', 'name');
+    if (!exam) {
       return res.status(404).json({ message: 'Exam not found' });
     }
 
-    // Get questions, hide correct_option if student is requesting
-    let qQuery = 'SELECT id, question_text, type, option_a, option_b, option_c, option_d, marks, negative_marks FROM exam_questions WHERE exam_id = ?';
-    if (req.user.role !== 'student') {
-      qQuery = 'SELECT * FROM exam_questions WHERE exam_id = ?';
-    }
+    // Map questions, hide correct_option if student is requesting
+    const formattedQuestions = exam.questions.map(q => {
+      const qObj = {
+        id: q._id.toString(),
+        question_text: q.question_text,
+        type: q.type,
+        option_a: q.option_a,
+        option_b: q.option_b,
+        option_c: q.option_c,
+        option_d: q.option_d,
+        marks: q.marks,
+        negative_marks: q.negative_marks
+      };
+      
+      if (req.user.role !== 'student') {
+        qObj.correct_option = q.correct_option;
+      }
+      return qObj;
+    });
 
-    const [questions] = await db.query(qQuery, [examId]);
-    res.json({ exam: exams[0], questions });
+    const formattedExam = {
+      id: exam._id.toString(),
+      name: exam.name,
+      type: exam.type,
+      class_id: exam.class ? exam.class._id.toString() : null,
+      class_name: exam.class ? exam.class.name : '',
+      start_date: exam.start_date,
+      end_date: exam.end_date,
+      total_marks: exam.total_marks,
+      passing_marks: exam.passing_marks,
+      status: exam.status
+    };
+
+    res.json({ exam: formattedExam, questions: formattedQuestions });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching exam details' });
@@ -107,69 +154,63 @@ exports.submitExam = async (req, res) => {
   const { exam_id, answers } = req.body; // answers: Map of { question_id: student_answer }
   const studentUserId = req.user.id;
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // 1. Fetch student profile
-    const [students] = await conn.query('SELECT id FROM students WHERE user_id = ?', [studentUserId]);
-    if (students.length === 0) {
+    const student = await Student.findOne({ user: studentUserId });
+    if (!student) {
       return res.status(404).json({ message: 'Student record not found' });
     }
-    const studentId = students[0].id;
 
-    // 2. Check if already submitted
-    const [existingSub] = await conn.query('SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ?', [exam_id, studentId]);
-    if (existingSub.length > 0) {
+    const exam = await Exam.findById(exam_id);
+    if (!exam) {
+      return res.status(404).json({ message: 'Exam not found' });
+    }
+
+    // Check if already submitted
+    const alreadySubmitted = exam.submissions.some(
+      sub => sub.student.toString() === student._id.toString()
+    );
+    if (alreadySubmitted) {
       return res.status(400).json({ message: 'You have already submitted this exam' });
     }
 
-    // 3. Fetch all questions for this exam to grade
-    const [questions] = await conn.query('SELECT * FROM exam_questions WHERE exam_id = ?', [exam_id]);
-
     let totalScore = 0;
+    const studentAnswers = [];
 
-    // 4. Create submission record
-    const [subResult] = await conn.query(
-      'INSERT INTO exam_submissions (exam_id, student_id, end_time, status, total_score) VALUES (?, ?, NOW(), "Submitted", 0)',
-      [exam_id, studentId]
-    );
-    const submissionId = subResult.insertId;
-
-    // 5. Grade each question
-    for (const q of questions) {
-      const studentAns = answers[q.id] || '';
+    // Grade each question
+    for (const q of exam.questions) {
+      const qIdStr = q._id.toString();
+      const studentAns = answers[qIdStr] || '';
       let marksObtained = 0;
 
       if (q.type === 'MCQ') {
         if (studentAns === q.correct_option) {
           marksObtained = parseFloat(q.marks);
         } else if (studentAns !== '') {
-          // Deduct negative marks if wrong and answered
           marksObtained = -parseFloat(q.negative_marks);
         }
       }
 
       totalScore += marksObtained;
-
-      // Insert into exam_answers
-      await conn.query(
-        'INSERT INTO exam_answers (submission_id, question_id, student_answer, marks_obtained) VALUES (?, ?, ?, ?)',
-        [submissionId, q.id, studentAns, marksObtained]
-      );
+      studentAnswers.push({
+        question_id: q._id,
+        student_answer: studentAns,
+        marks_obtained: marksObtained
+      });
     }
 
-    // Update total score in submission
-    await conn.query('UPDATE exam_submissions SET total_score = ? WHERE id = ?', [totalScore, submissionId]);
+    exam.submissions.push({
+      student: student._id,
+      end_time: new Date(),
+      status: 'Submitted',
+      total_score: totalScore,
+      answers: studentAnswers
+    });
 
-    await conn.commit();
+    await exam.save();
     res.json({ message: 'Exam submitted and graded successfully', score: totalScore });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error submitting exam: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -177,15 +218,26 @@ exports.submitExam = async (req, res) => {
 exports.getExamResults = async (req, res) => {
   const { examId } = req.params;
   try {
-    const [results] = await db.query(
-      `SELECT es.*, u.name as student_name, s.roll_number 
-       FROM exam_submissions es
-       JOIN students s ON es.student_id = s.id
-       JOIN users u ON s.user_id = u.id
-       WHERE es.exam_id = ? 
-       ORDER BY es.total_score DESC`,
-      [examId]
-    );
+    const exam = await Exam.findById(examId)
+      .populate({
+        path: 'submissions.student',
+        populate: { path: 'user', select: 'name' }
+      });
+
+    if (!exam) {
+      return res.status(404).json({ message: 'Exam not found' });
+    }
+
+    const results = exam.submissions.map(sub => ({
+      id: sub._id.toString(),
+      student_id: sub.student ? sub.student._id.toString() : null,
+      end_time: sub.end_time,
+      status: sub.status,
+      total_score: sub.total_score,
+      student_name: sub.student && sub.student.user ? sub.student.user.name : '',
+      roll_number: sub.student ? sub.student.roll_number : ''
+    })).sort((a, b) => b.total_score - a.total_score);
+
     res.json({ results });
   } catch (err) {
     console.error(err);
@@ -204,27 +256,22 @@ exports.enterMarks = async (req, res) => {
     return res.status(400).json({ message: 'Exam ID, subject ID, and marks list are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
     for (const entry of marks) {
-      await conn.query(
-        `INSERT INTO exam_marks (exam_id, student_id, subject_id, marks_obtained, remarks) 
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE marks_obtained = VALUES(marks_obtained), remarks = VALUES(remarks)`,
-        [exam_id, entry.student_id, subject_id, entry.marks_obtained, entry.remarks || '']
+      await ExamMark.findOneAndUpdate(
+        { exam: exam_id, student: entry.student_id, subject: subject_id },
+        {
+          marks_obtained: parseFloat(entry.marks_obtained),
+          remarks: entry.remarks || ''
+        },
+        { upsert: true, new: true }
       );
     }
 
-    await conn.commit();
     res.json({ message: 'Marks recorded successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error entering marks' });
-  } finally {
-    conn.release();
   }
 };
 
@@ -237,33 +284,53 @@ exports.getReportCard = async (req, res) => {
 
   try {
     // Get student details
-    const [students] = await db.query('SELECT * FROM view_student_profiles WHERE student_id = ?', [studentId]);
-    if (students.length === 0) return res.status(404).json({ message: 'Student not found' });
+    const student = await Student.findById(studentId)
+      .populate('user', 'name email phone avatar status')
+      .populate('class', 'name')
+      .populate('section', 'name');
+
+    if (!student) return res.status(404).json({ message: 'Student not found' });
+
+    const formattedStudent = {
+      student_id: student._id.toString(),
+      user_id: student.user ? student.user._id.toString() : null,
+      name: student.user ? student.user.name : '',
+      email: student.user ? student.user.email : '',
+      phone: student.user ? student.user.phone : '',
+      roll_number: student.roll_number,
+      admission_no: student.admission_number,
+      class_name: student.class ? student.class.name : '',
+      section_name: student.section ? student.section.name : '',
+      user_status: student.user ? student.user.status : 'inactive'
+    };
 
     // Get exam details
-    const [exams] = await db.query('SELECT * FROM exams WHERE id = ?', [examId]);
-    if (exams.length === 0) return res.status(404).json({ message: 'Exam not found' });
+    const exam = await Exam.findById(examId);
+    if (!exam) return res.status(404).json({ message: 'Exam not found' });
+
+    const formattedExam = {
+      id: exam._id.toString(),
+      name: exam.name,
+      type: exam.type,
+      total_marks: exam.total_marks,
+      passing_marks: exam.passing_marks
+    };
 
     // Get marks obtained
-    const [marks] = await db.query(
-      `SELECT em.*, s.name as subject_name, s.code as subject_code
-       FROM exam_marks em
-       JOIN subjects s ON em.subject_id = s.id
-       WHERE em.student_id = ? AND em.exam_id = ?`,
-      [studentId, examId]
-    );
+    const marks = await ExamMark.find({ student: studentId, exam: examId })
+      .populate('subject', 'name code');
 
     // Fetch grading scale
-    const [grades] = await db.query('SELECT * FROM grades ORDER BY point DESC');
+    const grades = await Grade.find().sort({ point: -1 });
 
     // Calculate Grade for each subject
     const reportDetails = marks.map(m => {
-      const percentage = (parseFloat(m.marks_obtained) / parseFloat(exams[0].total_marks)) * 100;
+      const percentage = (parseFloat(m.marks_obtained) / parseFloat(exam.total_marks)) * 100;
       let gradeName = 'F';
       let gradePoint = 0.00;
 
       for (const g of grades) {
-        if (percentage >= g.mark_from && percentage <= g.mark_to) {
+        if (percentage >= g.mark_from && percentage <= g.mark_upto) {
           gradeName = g.name;
           gradePoint = parseFloat(g.point);
           break;
@@ -271,7 +338,14 @@ exports.getReportCard = async (req, res) => {
       }
 
       return {
-        ...m,
+        id: m._id.toString(),
+        exam_id: m.exam.toString(),
+        student_id: m.student.toString(),
+        subject_id: m.subject ? m.subject._id.toString() : null,
+        marks_obtained: m.marks_obtained,
+        remarks: m.remarks || '',
+        subject_name: m.subject ? m.subject.name : '',
+        subject_code: m.subject ? m.subject.code : '',
         percentage,
         grade: gradeName,
         gp: gradePoint
@@ -283,8 +357,8 @@ exports.getReportCard = async (req, res) => {
     const gpa = reportDetails.length > 0 ? (totalGPs / reportDetails.length).toFixed(2) : '0.00';
 
     res.json({
-      student: students[0],
-      exam: exams[0],
+      student: formattedStudent,
+      exam: formattedExam,
       marks: reportDetails,
       gpa
     });

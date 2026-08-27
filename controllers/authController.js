@@ -1,4 +1,8 @@
-const db = require('../config/db');
+const User = require('../models/User');
+const Student = require('../models/Student');
+const Parent = require('../models/Parent');
+const Teacher = require('../models/Teacher');
+const Employee = require('../models/Employee');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { authenticator } = require('otplib');
@@ -11,15 +15,15 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'eskooly_refresh_se
 // Helper to generate tokens
 const generateTokens = (user) => {
   const accessToken = jwt.sign(
-    { id: user.id, name: user.name, email: user.email, role: user.role },
+    { id: user._id.toString(), name: user.name, email: user.email, role: user.role },
     JWT_SECRET,
-    { expiresIn: '15m' } // Short-lived access token
+    { expiresIn: '15m' }
   );
 
   const refreshToken = jwt.sign(
-    { id: user.id },
+    { id: user._id.toString() },
     JWT_REFRESH_SECRET,
-    { expiresIn: '7d' } // Long-lived refresh token
+    { expiresIn: '7d' }
   );
 
   return { accessToken, refreshToken };
@@ -27,14 +31,13 @@ const generateTokens = (user) => {
 
 // Login
 exports.login = async (req, res) => {
-  const { email, password, rememberMe } = req.body;
+  const { email, password } = req.body;
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
-    if (users.length === 0) {
+    const user = await User.findOne({ email });
+    if (!user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    const user = users[0];
     if (user.status !== 'active') {
       return res.status(403).json({ message: 'Your account is inactive. Please contact administration.' });
     }
@@ -46,7 +49,7 @@ exports.login = async (req, res) => {
 
     // Check if 2FA is enabled
     if (user.is_two_factor_enabled) {
-      const tempToken = jwt.sign({ id: user.id, temp: true }, JWT_SECRET, { expiresIn: '5m' });
+      const tempToken = jwt.sign({ id: user._id.toString(), temp: true }, JWT_SECRET, { expiresIn: '5m' });
       return res.json({
         twoFactorRequired: true,
         tempToken,
@@ -54,17 +57,15 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Generate tokens
     const { accessToken, refreshToken } = generateTokens(user);
-
-    // Save refresh token in DB
-    await db.query('UPDATE users SET refresh_token = ? WHERE id = ?', [refreshToken, user.id]);
+    user.refresh_token = refreshToken;
+    await user.save();
 
     res.json({
       token: accessToken,
       refreshToken,
       user: {
-        id: user.id,
+        id: user._id.toString(),
         name: user.name,
         email: user.email,
         role: user.role,
@@ -87,12 +88,11 @@ exports.verify2FA = async (req, res) => {
       return res.status(400).json({ message: 'Invalid temporary token' });
     }
 
-    const [users] = await db.query('SELECT * FROM users WHERE id = ?', [decoded.id]);
-    if (users.length === 0) {
+    const user = await User.findById(decoded.id);
+    if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const user = users[0];
     const verified = authenticator.verify({
       token: code,
       secret: user.two_factor_secret
@@ -103,13 +103,14 @@ exports.verify2FA = async (req, res) => {
     }
 
     const { accessToken, refreshToken } = generateTokens(user);
-    await db.query('UPDATE users SET refresh_token = ? WHERE id = ?', [refreshToken, user.id]);
+    user.refresh_token = refreshToken;
+    await user.save();
 
     res.json({
       token: accessToken,
       refreshToken,
       user: {
-        id: user.id,
+        id: user._id.toString(),
         name: user.name,
         email: user.email,
         role: user.role,
@@ -126,15 +127,17 @@ exports.verify2FA = async (req, res) => {
 // Setup 2FA
 exports.setup2FA = async (req, res) => {
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE id = ?', [req.user.id]);
-    const user = users[0];
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
 
     const secret = authenticator.generateSecret();
     const otpauth = authenticator.keyuri(user.email, 'Secondary School of Modern Education', secret);
     const qrCodeUrl = await QRCode.toDataURL(otpauth);
 
-    // Save secret temporarily in DB (we only enable it once they verify a code)
-    await db.query('UPDATE users SET two_factor_secret = ? WHERE id = ?', [secret, req.user.id]);
+    user.two_factor_secret = secret;
+    await user.save();
 
     res.json({ secret, qrCodeUrl });
   } catch (err) {
@@ -147,10 +150,8 @@ exports.setup2FA = async (req, res) => {
 exports.enable2FA = async (req, res) => {
   const { code } = req.body;
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE id = ?', [req.user.id]);
-    const user = users[0];
-
-    if (!user.two_factor_secret) {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.two_factor_secret) {
       return res.status(400).json({ message: '2FA setup not initiated' });
     }
 
@@ -163,7 +164,9 @@ exports.enable2FA = async (req, res) => {
       return res.status(400).json({ message: 'Invalid code. Verification failed.' });
     }
 
-    await db.query('UPDATE users SET is_two_factor_enabled = TRUE WHERE id = ?', [req.user.id]);
+    user.is_two_factor_enabled = true;
+    await user.save();
+
     res.json({ message: 'Two-factor authentication enabled successfully' });
   } catch (err) {
     console.error(err);
@@ -174,7 +177,10 @@ exports.enable2FA = async (req, res) => {
 // Disable 2FA
 exports.disable2FA = async (req, res) => {
   try {
-    await db.query('UPDATE users SET is_two_factor_enabled = FALSE, two_factor_secret = NULL WHERE id = ?', [req.user.id]);
+    await User.findByIdAndUpdate(req.user.id, {
+      is_two_factor_enabled: false,
+      two_factor_secret: null
+    });
     res.json({ message: 'Two-factor authentication disabled successfully' });
   } catch (err) {
     console.error(err);
@@ -191,16 +197,15 @@ exports.refreshToken = async (req, res) => {
 
   try {
     const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
-    const [users] = await db.query('SELECT * FROM users WHERE id = ? AND refresh_token = ?', [decoded.id, refreshToken]);
+    const user = await User.findOne({ _id: decoded.id, refresh_token: refreshToken });
     
-    if (users.length === 0) {
+    if (!user) {
       return res.status(403).json({ message: 'Invalid refresh token' });
     }
 
-    const user = users[0];
     const tokens = generateTokens(user);
-
-    await db.query('UPDATE users SET refresh_token = ? WHERE id = ?', [tokens.refreshToken, user.id]);
+    user.refresh_token = tokens.refreshToken;
+    await user.save();
 
     res.json({
       token: tokens.accessToken,
@@ -216,19 +221,18 @@ exports.refreshToken = async (req, res) => {
 exports.forgotPassword = async (req, res) => {
   const { email } = req.body;
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
-    if (users.length === 0) {
+    const user = await User.findOne({ email });
+    if (!user) {
       return res.status(404).json({ message: 'User with this email does not exist' });
     }
 
-    const user = users[0];
-    // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    await db.query('UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ?', [otp, expiresAt, user.id]);
+    user.otp_code = otp;
+    user.otp_expires_at = expiresAt;
+    await user.save();
 
-    // Send email
     await sendEmail(
       user.email,
       'Password Reset OTP - Secondary School of Modern Education',
@@ -247,15 +251,17 @@ exports.forgotPassword = async (req, res) => {
 exports.verifyOTP = async (req, res) => {
   const { email, otp } = req.body;
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE email = ? AND otp_code = ? AND otp_expires_at > NOW()', [email, otp]);
-    if (users.length === 0) {
+    const user = await User.findOne({
+      email,
+      otp_code: otp,
+      otp_expires_at: { $gt: new Date() }
+    });
+
+    if (!user) {
       return res.status(400).json({ message: 'Invalid or expired OTP' });
     }
 
-    // OTP is valid. Generate temporary reset token
-    const user = users[0];
-    const resetToken = jwt.sign({ id: user.id, reset: true }, JWT_SECRET, { expiresIn: '15m' });
-
+    const resetToken = jwt.sign({ id: user._id.toString(), reset: true }, JWT_SECRET, { expiresIn: '15m' });
     res.json({ resetToken, message: 'OTP verified successfully' });
   } catch (err) {
     console.error(err);
@@ -272,11 +278,17 @@ exports.resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'Invalid reset token' });
     }
 
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await db.query(
-      'UPDATE users SET password = ?, otp_code = NULL, otp_expires_at = NULL, refresh_token = NULL WHERE id = ?',
-      [hashedPassword, decoded.id]
-    );
+    user.password = hashedPassword;
+    user.otp_code = null;
+    user.otp_expires_at = null;
+    user.refresh_token = null;
+    await user.save();
 
     res.json({ message: 'Password reset successful. Please login with your new password.' });
   } catch (err) {
@@ -285,20 +297,22 @@ exports.resetPassword = async (req, res) => {
   }
 };
 
-// Change Password (when logged in)
+// Change Password
 exports.changePassword = async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE id = ?', [req.user.id]);
-    const user = users[0];
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
 
     const isMatch = await bcrypt.compare(oldPassword, user.password);
     if (!isMatch) {
       return res.status(400).json({ message: 'Incorrect old password' });
     }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await db.query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, req.user.id]);
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
 
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
@@ -310,51 +324,72 @@ exports.changePassword = async (req, res) => {
 // Get Profile
 exports.getProfile = async (req, res) => {
   try {
-    const [users] = await db.query('SELECT id, name, email, role, phone, avatar, is_two_factor_enabled, status, created_at FROM users WHERE id = ?', [req.user.id]);
-    if (users.length === 0) {
+    const user = await User.findById(req.user.id).select('-password -refresh_token');
+    if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const user = users[0];
     let extraDetails = {};
+    const userId = user._id;
 
-    // Get role-specific details
     if (user.role === 'student') {
-      const [students] = await db.query(
-        `SELECT s.*, c.name AS class_name, sec.name AS section_name, p.father_name, p.father_phone 
-         FROM students s 
-         JOIN classes c ON s.class_id = c.id 
-         JOIN sections sec ON s.section_id = sec.id 
-         LEFT JOIN parents p ON s.parent_id = p.id 
-         WHERE s.user_id = ?`, 
-        [user.id]
-      );
-      if (students.length > 0) extraDetails = students[0];
+      const student = await Student.findOne({ user: userId })
+        .populate('class', 'name')
+        .populate('section', 'name')
+        .populate({
+          path: 'parent',
+          populate: { path: 'user', select: 'name email phone' }
+        });
+      
+      if (student) {
+        extraDetails = {
+          ...student.toObject(),
+          class_name: student.class ? student.class.name : '',
+          section_name: student.section ? student.section.name : '',
+          father_name: student.parent ? student.parent.father_name : '',
+          father_phone: student.parent ? student.parent.father_phone : ''
+        };
+      }
     } else if (user.role === 'teacher') {
-      const [teachers] = await db.query('SELECT * FROM teachers WHERE user_id = ?', [user.id]);
-      if (teachers.length > 0) extraDetails = teachers[0];
+      const teacher = await Teacher.findOne({ user: userId });
+      if (teacher) extraDetails = teacher.toObject();
     } else if (['accountant', 'librarian', 'receptionist', 'hr', 'transport_manager', 'hostel_manager'].includes(user.role)) {
-      const [employees] = await db.query('SELECT * FROM employees WHERE user_id = ?', [user.id]);
-      if (employees.length > 0) extraDetails = employees[0];
+      const employee = await Employee.findOne({ user: userId });
+      if (employee) extraDetails = employee.toObject();
     } else if (user.role === 'parent') {
-      const [parents] = await db.query('SELECT * FROM parents WHERE user_id = ?', [user.id]);
-      if (parents.length > 0) {
-        extraDetails = parents[0];
+      const parent = await Parent.findOne({ user: userId });
+      if (parent) {
+        extraDetails = parent.toObject();
         // Fetch children
-        const [children] = await db.query(
-          `SELECT s.id, u.name, s.roll_number, c.name AS class_name, sec.name AS section_name 
-           FROM students s 
-           JOIN users u ON s.user_id = u.id 
-           JOIN classes c ON s.class_id = c.id 
-           JOIN sections sec ON s.section_id = sec.id 
-           WHERE s.parent_id = ?`, 
-          [extraDetails.id]
-        );
-        extraDetails.children = children;
+        const children = await Student.find({ parent: parent._id })
+          .populate('class', 'name')
+          .populate('section', 'name')
+          .populate('user', 'name');
+        
+        extraDetails.children = children.map(child => ({
+          id: child._id.toString(),
+          name: child.user ? child.user.name : '',
+          roll_number: child.roll_number,
+          class_name: child.class ? child.class.name : '',
+          section_name: child.section ? child.section.name : ''
+        }));
       }
     }
 
-    res.json({ user, details: extraDetails });
+    res.json({
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        phone: user.phone,
+        avatar: user.avatar,
+        status: user.status,
+        is_two_factor_enabled: user.is_two_factor_enabled,
+        created_at: user.created_at
+      },
+      details: extraDetails
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -365,12 +400,7 @@ exports.getProfile = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   const { name, phone, avatar } = req.body;
   try {
-    await db.query(
-      'UPDATE users SET name = ?, phone = ?, avatar = ? WHERE id = ?',
-      [name, phone, avatar, req.user.id]
-    );
-
-    // If student/teacher, we can also update name in their respective tables if needed (though we join users usually)
+    await User.findByIdAndUpdate(req.user.id, { name, phone, avatar });
     res.json({ message: 'Profile updated successfully' });
   } catch (err) {
     console.error(err);
@@ -382,7 +412,7 @@ exports.updateProfile = async (req, res) => {
 exports.logout = async (req, res) => {
   try {
     if (req.user) {
-      await db.query('UPDATE users SET refresh_token = NULL WHERE id = ?', [req.user.id]);
+      await User.findByIdAndUpdate(req.user.id, { refresh_token: null });
     }
     res.json({ message: 'Logged out successfully' });
   } catch (err) {
@@ -391,20 +421,27 @@ exports.logout = async (req, res) => {
   }
 };
 
-// Setup Admin helper
+// Setup Admin
 exports.setupAdmin = async (req, res) => {
   try {
-    const [users] = await db.query('SELECT * FROM users WHERE email = ?', ['admin@eskooly.com']);
+    const adminEmail = 'admin@eskooly.com';
     const hashedPassword = await bcrypt.hash('admin123', 10);
-
-    if (users.length === 0) {
-      await db.query(
-        'INSERT INTO users (name, email, password, role, status) VALUES (?, ?, ?, ?, "active")',
-        ['Admin', 'admin@eskooly.com', hashedPassword, 'school_admin']
-      );
+    
+    let admin = await User.findOne({ email: adminEmail });
+    if (!admin) {
+      admin = new User({
+        name: 'Admin',
+        email: adminEmail,
+        password: hashedPassword,
+        role: 'school_admin',
+        status: 'active'
+      });
+      await admin.save();
       res.json({ message: 'Admin created with password: admin123' });
     } else {
-      await db.query('UPDATE users SET password = ?, status = "active" WHERE email = ?', [hashedPassword, 'admin@eskooly.com']);
+      admin.password = hashedPassword;
+      admin.status = 'active';
+      await admin.save();
       res.json({ message: 'Admin updated with hashed password' });
     }
   } catch (err) {
@@ -412,4 +449,3 @@ exports.setupAdmin = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
-

@@ -1,4 +1,7 @@
-const db = require('../config/db');
+const Employee = require('../models/Employee');
+const User = require('../models/User');
+const Leave = require('../models/Leave');
+const AccountsLedger = require('../models/AccountsLedger');
 const bcrypt = require('bcryptjs');
 
 // ==========================================================
@@ -9,22 +12,30 @@ const bcrypt = require('bcryptjs');
 exports.getEmployees = async (req, res) => {
   const { department } = req.query;
   try {
-    let query = `
-      SELECT e.*, u.name, u.email, u.phone, u.role, u.status AS user_status
-      FROM employees e
-      JOIN users u ON e.user_id = u.id
-      WHERE 1=1
-    `;
-    const params = [];
-
+    const filter = {};
     if (department) {
-      query += ' AND e.department = ?';
-      params.push(department);
+      filter.department = department;
     }
 
-    query += ' ORDER BY e.id DESC';
-    const [employees] = await db.query(query, params);
-    res.json({ employees });
+    const employees = await Employee.find(filter).populate('user').sort({ created_at: -1 });
+
+    const formattedEmployees = employees.map(e => ({
+      id: e._id.toString(),
+      user_id: e.user ? e.user._id.toString() : null,
+      employee_id: e.employee_id || '',
+      department: e.department || '',
+      designation: e.designation || '',
+      salary: e.salary || 0,
+      status: e.status || 'active',
+      joining_date: e.joining_date,
+      name: e.user ? e.user.name : '',
+      email: e.user ? e.user.email : '',
+      phone: e.user ? e.user.phone : '',
+      role: e.user ? e.user.role : '',
+      user_status: e.user ? e.user.status : 'inactive'
+    }));
+
+    res.json({ employees: formattedEmployees });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching employees' });
@@ -38,34 +49,36 @@ exports.createEmployee = async (req, res) => {
     return res.status(400).json({ message: 'All fields are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
     // 1. Create User
     const hashedPassword = await bcrypt.hash(password || 'staff123', 10);
-    const [userResult] = await conn.query(
-      'INSERT INTO users (name, email, password, role, phone, status) VALUES (?, ?, ?, ?, ?, "active")',
-      [name, email, hashedPassword, role, phone]
-    );
-    const userId = userResult.insertId;
+    const newUser = new User({
+      name,
+      email,
+      password: hashedPassword,
+      role,
+      phone,
+      status: 'active'
+    });
+    await newUser.save();
 
     // 2. Create Employee Profile
-    const hireDate = new Date().toISOString().slice(0, 10);
-    await conn.query(
-      `INSERT INTO employees (user_id, employee_id, department, designation, salary, status, hire_date) 
-       VALUES (?, ?, ?, ?, ?, 'active', ?)`,
-      [userId, employee_id, department, designation, salary, hireDate]
-    );
+    const hireDate = new Date();
+    const newEmployee = new Employee({
+      user: newUser._id,
+      employee_id,
+      department,
+      designation,
+      salary: parseFloat(salary),
+      status: 'active',
+      joining_date: hireDate
+    });
+    await newEmployee.save();
 
-    await conn.commit();
     res.status(201).json({ message: 'Employee registered successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error registering employee: ' + err.message });
-  } finally {
-    conn.release();
   }
 };
 
@@ -81,14 +94,31 @@ exports.getPayroll = async (req, res) => {
   }
 
   try {
-    const [payroll] = await db.query(
-      `SELECT p.*, e.employee_id as emp_code, e.department, e.designation, u.name as employee_name
-       FROM employee_payroll p
-       JOIN employees e ON p.employee_id = e.id
-       JOIN users u ON e.user_id = u.id
-       WHERE p.month = ? AND p.year = ?`,
-      [month, year]
-    );
+    const employees = await Employee.find({}).populate('user', 'name');
+    
+    const payroll = [];
+    employees.forEach(emp => {
+      const p = emp.payrolls.find(item => item.month === month && item.year === year);
+      if (p) {
+        payroll.push({
+          id: p._id.toString(),
+          employee_id: emp._id.toString(),
+          month: p.month,
+          year: p.year,
+          basic_salary: p.basic_salary,
+          allowance: p.allowance || 0,
+          deduction: p.deduction || 0,
+          net_salary: p.net_salary,
+          status: p.status,
+          payment_date: p.payment_date || null,
+          emp_code: emp.employee_id || '',
+          department: emp.department,
+          designation: emp.designation,
+          employee_name: emp.user ? emp.user.name : ''
+        });
+      }
+    });
+
     res.json({ payroll });
   } catch (err) {
     console.error(err);
@@ -103,41 +133,40 @@ exports.generatePayroll = async (req, res) => {
     return res.status(400).json({ message: 'Month and Year are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // Fetch all active employees
-    const [employees] = await conn.query('SELECT id, salary FROM employees WHERE status = "active"');
+    const employees = await Employee.find({ status: 'active' });
     
     let generatedCount = 0;
     for (const emp of employees) {
-      const basicSalary = parseFloat(emp.salary);
-      const allowance = 0.00;
-      const deduction = 0.00;
-      const netSalary = basicSalary + allowance - deduction;
+      const alreadyExists = emp.payrolls.some(p => p.month === month && p.year === year);
+      if (!alreadyExists) {
+        const basicSalary = parseFloat(emp.salary || 0);
+        const allowance = 0.00;
+        const deduction = 0.00;
+        const netSalary = basicSalary + allowance - deduction;
 
-      // Insert payroll record, ignore if already exists
-      await conn.query(
-        `INSERT IGNORE INTO employee_payroll (employee_id, month, year, basic_salary, allowance, deduction, net_salary, status) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'Unpaid')`,
-        [emp.id, month, year, basicSalary, allowance, deduction, netSalary]
-      );
-      generatedCount++;
+        emp.payrolls.push({
+          month,
+          year,
+          basic_salary: basicSalary,
+          allowance,
+          deduction,
+          net_salary: netSalary,
+          status: 'Unpaid'
+        });
+        await emp.save();
+        generatedCount++;
+      }
     }
 
-    await conn.commit();
     res.json({ message: `Payroll generated for ${generatedCount} employees` });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error generating payroll' });
-  } finally {
-    conn.release();
   }
 };
 
-// Pay salary (Updates status, triggers ledger expense logging via DB trigger)
+// Pay salary (Updates status, manually logs expense in AccountsLedger)
 exports.paySalary = async (req, res) => {
   const { payroll_id } = req.body;
   if (!payroll_id) {
@@ -145,16 +174,35 @@ exports.paySalary = async (req, res) => {
   }
 
   try {
-    const paymentDate = new Date().toISOString().slice(0, 10);
-    // Update status to Paid (this will fire the after_payroll_payment_update trigger)
-    const [result] = await db.query(
-      'UPDATE employee_payroll SET status = "Paid", payment_date = ? WHERE id = ? AND status = "Unpaid"',
-      [paymentDate, payroll_id]
-    );
-
-    if (result.affectedRows === 0) {
-      return res.status(400).json({ message: 'Salary already paid or payroll record not found' });
+    const employee = await Employee.findOne({ 'payrolls._id': payroll_id }).populate('user', 'name');
+    if (!employee) {
+      return res.status(404).json({ message: 'Payroll record not found' });
     }
+
+    const p = employee.payrolls.id(payroll_id);
+    if (!p) {
+      return res.status(404).json({ message: 'Payroll record not found' });
+    }
+
+    if (p.status === 'Paid') {
+      return res.status(400).json({ message: 'Salary already paid' });
+    }
+
+    const paymentDate = new Date();
+    p.status = 'Paid';
+    p.payment_date = paymentDate;
+    await employee.save();
+
+    // Manually log salary disbursement as an Expense in AccountsLedger (Replacing SQL Trigger behavior)
+    const ledgerEntry = new AccountsLedger({
+      date: paymentDate,
+      type: 'Expense',
+      category: 'Salary',
+      title: `Salary Disbursement - ${employee.user ? employee.user.name : 'Staff'} (${p.month}/${p.year})`,
+      description: `Payroll basic salary payment.`,
+      amount: p.net_salary
+    });
+    await ledgerEntry.save();
 
     res.json({ message: 'Salary payment processed and logged in ledger successfully' });
   } catch (err) {
@@ -170,22 +218,29 @@ exports.paySalary = async (req, res) => {
 // Get leave requests (Teachers/Staff)
 exports.getLeaves = async (req, res) => {
   try {
-    let query = `
-      SELECT l.*, u.name as employee_name, u.role as employee_role 
-      FROM leaves l
-      JOIN users u ON l.user_id = u.id
-    `;
-    const params = [];
+    const filter = {};
     
-    // If not admin, only show user's own leaves
+    // If not admin/HR, only show user's own leaves
     if (!['super_admin', 'school_admin', 'principal', 'vice_principal', 'hr'].includes(req.user.role)) {
-      query += ' WHERE l.user_id = ?';
-      params.push(req.user.id);
+      filter.user = req.user.id;
     }
 
-    query += ' ORDER BY l.id DESC';
-    const [leaves] = await db.query(query, params);
-    res.json({ leaves });
+    const leaves = await Leave.find(filter).populate('user', 'name role').sort({ created_at: -1 });
+
+    const formattedLeaves = leaves.map(l => ({
+      id: l._id.toString(),
+      user_id: l.user ? l.user._id.toString() : null,
+      leave_type: l.leave_type,
+      start_date: l.start_date,
+      end_date: l.end_date,
+      reason: l.reason,
+      status: l.status,
+      approved_by: l.approved_by ? l.approved_by.toString() : null,
+      employee_name: l.user ? l.user.name : '',
+      employee_role: l.user ? l.user.role : ''
+    }));
+
+    res.json({ leaves: formattedLeaves });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching leaves' });
@@ -200,10 +255,16 @@ exports.requestLeave = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'INSERT INTO leaves (user_id, leave_type, start_date, end_date, reason, status) VALUES (?, ?, ?, ?, ?, "Pending")',
-      [req.user.id, leave_type, start_date, end_date, reason]
-    );
+    const newLeave = new Leave({
+      user: req.user.id,
+      leave_type,
+      start_date: new Date(start_date),
+      end_date: new Date(end_date),
+      reason,
+      status: 'Pending'
+    });
+    await newLeave.save();
+
     res.status(201).json({ message: 'Leave request submitted successfully' });
   } catch (err) {
     console.error(err);
@@ -220,10 +281,15 @@ exports.updateLeaveStatus = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'UPDATE leaves SET status = ?, approved_by = ? WHERE id = ?',
-      [status, req.user.id, id]
-    );
+    const leave = await Leave.findById(id);
+    if (!leave) {
+      return res.status(404).json({ message: 'Leave request not found' });
+    }
+
+    leave.status = status;
+    leave.approved_by = req.user.id;
+    await leave.save();
+
     res.json({ message: `Leave request has been ${status.toLowerCase()}` });
   } catch (err) {
     console.error(err);

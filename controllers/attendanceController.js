@@ -1,4 +1,13 @@
-const db = require('../config/db');
+const Attendance = require('../models/Attendance');
+const Student = require('../models/Student');
+const User = require('../models/User');
+const Parent = require('../models/Parent');
+
+// Helper to normalize date to UTC midnight
+const getMidnightUTC = (dateStr) => {
+  const d = new Date(dateStr);
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0));
+};
 
 // Get attendance for a class, section, and date
 exports.getAttendance = async (req, res) => {
@@ -8,29 +17,34 @@ exports.getAttendance = async (req, res) => {
   }
 
   try {
+    const queryDate = getMidnightUTC(date);
+
     // Fetch all students in the class/section
-    const [students] = await db.query(
-      `SELECT s.id AS student_id, u.id AS user_id, u.name, s.roll_number 
-       FROM students s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.class_id = ? AND s.section_id = ? AND s.status = "active"
-       ORDER BY s.roll_number ASC`,
-      [classId, sectionId]
-    );
+    const students = await Student.find({
+      class: classId,
+      section: sectionId,
+      status: 'active'
+    }).populate('user', 'name').sort({ roll_number: 1 });
+
+    const studentUserIds = students.map(s => s.user ? s.user._id : null).filter(Boolean);
 
     // Fetch attendance for these students on the given date
-    const [attendanceRecord] = await db.query(
-      'SELECT user_id, status, remarks, qr_code_used FROM attendance WHERE date = ?',
-      [date]
-    );
+    const attendanceRecords = await Attendance.find({
+      user: { $in: studentUserIds },
+      date: queryDate
+    });
 
     // Map attendance status to student list
-    const attendanceMap = new Map(attendanceRecord.map(att => [att.user_id, att]));
+    const attendanceMap = new Map(attendanceRecords.map(att => [att.user.toString(), att]));
 
     const studentsWithAttendance = students.map(student => {
-      const record = attendanceMap.get(student.user_id);
+      const userIdStr = student.user ? student.user._id.toString() : '';
+      const record = attendanceMap.get(userIdStr);
       return {
-        ...student,
+        student_id: student._id.toString(),
+        user_id: userIdStr,
+        name: student.user ? student.user.name : '',
+        roll_number: student.roll_number,
         status: record ? record.status : 'Present', // Default to Present if not marked
         remarks: record ? record.remarks : '',
         qr_code_used: record ? !!record.qr_code_used : false,
@@ -52,58 +66,68 @@ exports.saveAttendance = async (req, res) => {
     return res.status(400).json({ message: 'Date and attendance list are required' });
   }
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
+    const queryDate = getMidnightUTC(date);
 
     for (const item of attendanceList) {
-      await conn.query(
-        `INSERT INTO attendance (user_id, date, status, remarks, checked_by) 
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE status = VALUES(status), remarks = VALUES(remarks), checked_by = VALUES(checked_by)`,
-        [item.user_id, date, item.status, item.remarks || '', req.user.id]
+      const student = await Student.findOne({ user: item.user_id });
+      
+      await Attendance.findOneAndUpdate(
+        { user: item.user_id, date: queryDate },
+        {
+          user: item.user_id,
+          class: student ? student.class : undefined,
+          section: student ? student.section : undefined,
+          date: queryDate,
+          status: item.status,
+          remarks: item.remarks || '',
+          checked_by: req.user.id
+        },
+        { upsert: true, new: true }
       );
     }
 
-    await conn.commit();
     res.json({ message: 'Attendance saved successfully' });
   } catch (err) {
-    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: 'Server error saving attendance' });
-  } finally {
-    conn.release();
   }
 };
 
 // QR Attendance Scan Check-in
 exports.scanQRAttendance = async (req, res) => {
-  const { userId } = req.body; // The QR code contains the user ID (e.g., student or teacher)
-  const today = new Date().toISOString().slice(0, 10);
+  const { userId } = req.body;
+  const today = getMidnightUTC(new Date());
 
   if (!userId) {
     return res.status(400).json({ message: 'User ID is required' });
   }
 
   try {
-    // Check if user exists and is active
-    const [users] = await db.query('SELECT id, name, role FROM users WHERE id = ? AND status = "active"', [userId]);
-    if (users.length === 0) {
+    const user = await User.findOne({ _id: userId, status: 'active' });
+    if (!user) {
       return res.status(404).json({ message: 'Active user not found' });
     }
 
-    const user = users[0];
+    const student = await Student.findOne({ user: user._id });
 
-    // Mark attendance
-    await db.query(
-      `INSERT INTO attendance (user_id, date, status, remarks, qr_code_used, checked_by) 
-       VALUES (?, ?, 'Present', 'QR Code Checked In', TRUE, ?)
-       ON DUPLICATE KEY UPDATE status = 'Present', qr_code_used = TRUE`,
-      [user.id, today, req.user.id]
+    await Attendance.findOneAndUpdate(
+      { user: user._id, date: today },
+      {
+        user: user._id,
+        class: student ? student.class : undefined,
+        section: student ? student.section : undefined,
+        date: today,
+        status: 'Present',
+        remarks: 'QR Code Checked In',
+        qr_code_used: true,
+        checked_by: req.user.id
+      },
+      { upsert: true, new: true }
     );
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Checked in: ${user.name} (${user.role})`,
       name: user.name,
       role: user.role,
@@ -123,41 +147,41 @@ exports.getMonthlyReport = async (req, res) => {
   }
 
   try {
-    // Get number of days in the month
-    const daysInMonth = new Date(year, month, 0).getDate();
+    const targetYear = parseInt(year);
+    const targetMonth = parseInt(month);
+    const daysInMonth = new Date(targetYear, targetMonth, 0).getDate();
 
-    // Get all students
-    const [students] = await db.query(
-      `SELECT s.id AS student_id, u.id AS user_id, u.name, s.roll_number 
-       FROM students s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.class_id = ? AND s.section_id = ? AND s.status = "active"
-       ORDER BY s.roll_number ASC`,
-      [classId, sectionId]
-    );
+    // Get all active students
+    const students = await Student.find({
+      class: classId,
+      section: sectionId,
+      status: 'active'
+    }).populate('user', 'name').sort({ roll_number: 1 });
+
+    const studentUserIds = students.map(s => s.user ? s.user._id : null).filter(Boolean);
 
     // Get all attendance for the month
-    const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-    const endDate = `${year}-${String(month).padStart(2, '0')}-${daysInMonth}`;
+    const startDate = new Date(Date.UTC(targetYear, targetMonth - 1, 1, 0, 0, 0, 0));
+    const endDate = new Date(Date.UTC(targetYear, targetMonth - 1, daysInMonth, 23, 59, 59, 999));
 
-    const [records] = await db.query(
-      `SELECT user_id, DAY(date) as day, status 
-       FROM attendance 
-       WHERE user_id IN (SELECT user_id FROM students WHERE class_id = ? AND section_id = ?)
-       AND date BETWEEN ? AND ?`,
-      [classId, sectionId, startDate, endDate]
-    );
+    const records = await Attendance.find({
+      user: { $in: studentUserIds },
+      date: { $gte: startDate, $lte: endDate }
+    });
 
-    // Group records by user_id
+    // Group records by user_id and day
     const attendanceMap = {};
     records.forEach(rec => {
-      if (!attendanceMap[rec.user_id]) {
-        attendanceMap[rec.user_id] = {};
+      const day = new Date(rec.date).getUTCDate();
+      const userIdStr = rec.user.toString();
+      if (!attendanceMap[userIdStr]) {
+        attendanceMap[userIdStr] = {};
       }
-      attendanceMap[rec.user_id][rec.day] = rec.status;
+      attendanceMap[userIdStr][day] = rec.status;
     });
 
     const report = students.map(student => {
+      const userIdStr = student.user ? student.user._id.toString() : '';
       const days = {};
       let presents = 0;
       let absents = 0;
@@ -165,7 +189,7 @@ exports.getMonthlyReport = async (req, res) => {
       let halfDays = 0;
 
       for (let d = 1; d <= daysInMonth; d++) {
-        const status = (attendanceMap[student.user_id] && attendanceMap[student.user_id][d]) || '-';
+        const status = (attendanceMap[userIdStr] && attendanceMap[userIdStr][d]) || '-';
         days[d] = status;
         if (status === 'Present') presents++;
         else if (status === 'Absent') absents++;
@@ -174,11 +198,11 @@ exports.getMonthlyReport = async (req, res) => {
       }
 
       const totalDays = presents + absents + lates + halfDays;
-      const attendancePercentage = totalDays > 0 ? Math.round(((presents + lates*0.8 + halfDays*0.5) / totalDays) * 100) : 100;
+      const attendancePercentage = totalDays > 0 ? Math.round(((presents + lates * 0.8 + halfDays * 0.5) / totalDays) * 100) : 100;
 
       return {
-        student_id: student.student_id,
-        name: student.name,
+        student_id: student._id.toString(),
+        name: student.user ? student.user.name : '',
         roll_number: student.roll_number,
         days,
         stats: { presents, absents, lates, halfDays, percentage: attendancePercentage }
@@ -201,30 +225,25 @@ exports.getMyAttendance = async (req, res) => {
   let targetUserId = loggedInUserId;
 
   try {
-    // If studentUserId is specified, check permission
     if (studentUserId) {
-      const parsedStudentUserId = parseInt(studentUserId);
       if (role === 'parent') {
-        // Verify child-parent relationship
-        const [relation] = await db.query(
-          `SELECT s.id 
-           FROM students s 
-           JOIN parents p ON s.parent_id = p.id 
-           WHERE s.user_id = ? AND p.user_id = ?`,
-          [parsedStudentUserId, loggedInUserId]
-        );
-        if (relation.length === 0) {
+        const parent = await Parent.findOne({ user: loggedInUserId });
+        const childRelation = await Student.findOne({
+          user: studentUserId,
+          parent: parent ? parent._id : null
+        });
+
+        if (!childRelation) {
           return res.status(403).json({ message: 'Access denied: Selected student is not your child' });
         }
-        targetUserId = parsedStudentUserId;
+        targetUserId = studentUserId;
       } else if (role === 'student') {
-        if (parsedStudentUserId !== loggedInUserId) {
+        if (studentUserId !== loggedInUserId) {
           return res.status(403).json({ message: 'Access denied: Students can only view their own attendance' });
         }
         targetUserId = loggedInUserId;
       } else if (['super_admin', 'school_admin', 'principal', 'vice_principal', 'teacher'].includes(role)) {
-        // Authorized roles can view any student's attendance
-        targetUserId = parsedStudentUserId;
+        targetUserId = studentUserId;
       } else {
         return res.status(403).json({ message: 'Access denied' });
       }
@@ -233,39 +252,23 @@ exports.getMyAttendance = async (req, res) => {
     const targetYear = year ? parseInt(year) : new Date().getFullYear();
     const targetMonth = month ? parseInt(month) : (new Date().getMonth() + 1);
     const daysInMonth = new Date(targetYear, targetMonth, 0).getDate();
-    const startDate = `${targetYear}-${String(targetMonth).padStart(2, '0')}-01`;
-    const endDate = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${daysInMonth}`;
 
-    // Get attendance records for the target user in this date range
-    const [records] = await db.query(
-      `SELECT date, status, remarks, qr_code_used 
-       FROM attendance 
-       WHERE user_id = ? AND date BETWEEN ? AND ?
-       ORDER BY date ASC`,
-      [targetUserId, startDate, endDate]
-    );
+    const startDate = new Date(Date.UTC(targetYear, targetMonth - 1, 1, 0, 0, 0, 0));
+    const endDate = new Date(Date.UTC(targetYear, targetMonth - 1, daysInMonth, 23, 59, 59, 999));
 
-    // Get overall stats for this user
-    const [[allTimeStats]] = await db.query(
-      `SELECT 
-         COUNT(*) as total,
-         SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) as presents,
-         SUM(CASE WHEN status = 'Absent' THEN 1 ELSE 0 END) as absents,
-         SUM(CASE WHEN status = 'Late' THEN 1 ELSE 0 END) as lates,
-         SUM(CASE WHEN status = 'Half Day' THEN 1 ELSE 0 END) as half_days
-       FROM attendance 
-       WHERE user_id = ?`,
-      [targetUserId]
-    );
+    const records = await Attendance.find({
+      user: targetUserId,
+      date: { $gte: startDate, $lte: endDate }
+    }).sort({ date: 1 });
 
-    // Calculate percentage
-    const presents = parseInt(allTimeStats?.presents || 0);
-    const absents = parseInt(allTimeStats?.absents || 0);
-    const lates = parseInt(allTimeStats?.lates || 0);
-    const halfDays = parseInt(allTimeStats?.half_days || 0);
-    const total = parseInt(allTimeStats?.total || 0);
+    // Fetch stats for all time
+    const total = await Attendance.countDocuments({ user: targetUserId });
+    const presents = await Attendance.countDocuments({ user: targetUserId, status: 'Present' });
+    const absents = await Attendance.countDocuments({ user: targetUserId, status: 'Absent' });
+    const lates = await Attendance.countDocuments({ user: targetUserId, status: 'Late' });
+    const halfDays = await Attendance.countDocuments({ user: targetUserId, status: 'Half Day' });
 
-    const percentage = total > 0 
+    const percentage = total > 0
       ? Math.round(((presents + lates * 0.8 + halfDays * 0.5) / total) * 100)
       : 100;
 
@@ -274,7 +277,12 @@ exports.getMyAttendance = async (req, res) => {
       year: targetYear,
       month: targetMonth,
       daysInMonth,
-      records,
+      records: records.map(rec => ({
+        date: rec.date,
+        status: rec.status,
+        remarks: rec.remarks || '',
+        qr_code_used: !!rec.qr_code_used
+      })),
       stats: {
         total,
         presents,

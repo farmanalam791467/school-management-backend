@@ -1,27 +1,33 @@
-const db = require('../config/db');
+const Notice = require('../models/Notice');
+const User = require('../models/User');
 
 // Get notices
 exports.getNotices = async (req, res) => {
   const currentRole = req.user.role;
   try {
-    let query = `
-      SELECT n.*, u.name as author_name 
-      FROM notices n
-      JOIN users u ON n.created_by = u.id
-    `;
-    const params = [];
+    const filter = {};
 
     // Filter by role
     if (['student', 'parent', 'teacher'].includes(currentRole)) {
-      query += ' WHERE n.target_audience IN ("All", ?)';
-      params.push(currentRole === 'parent' ? 'Parents' : currentRole === 'student' ? 'Students' : 'Teachers');
+      const audience = currentRole === 'parent' ? 'Parents' : currentRole === 'student' ? 'Students' : 'Teachers';
+      filter.target_audience = { $in: ['All', audience] };
     } else if (['accountant', 'librarian', 'receptionist', 'hr', 'transport_manager', 'hostel_manager'].includes(currentRole)) {
-      query += ' WHERE n.target_audience IN ("All", "Staff")';
+      filter.target_audience = { $in: ['All', 'Staff'] };
     }
 
-    query += ' ORDER BY n.id DESC';
-    const [notices] = await db.query(query, params);
-    res.json({ notices });
+    const notices = await Notice.find(filter).populate('created_by', 'name').sort({ created_at: -1 });
+
+    const formattedNotices = notices.map(n => ({
+      id: n._id.toString(),
+      title: n.title,
+      content: n.description,
+      target_audience: n.target_audience,
+      created_by: n.created_by ? n.created_by._id.toString() : null,
+      author_name: n.created_by ? n.created_by.name : 'Unknown',
+      created_at: n.created_at
+    }));
+
+    res.json({ notices: formattedNotices });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error fetching notices' });
@@ -36,10 +42,13 @@ exports.createNotice = async (req, res) => {
   }
 
   try {
-    await db.query(
-      'INSERT INTO notices (title, content, target_audience, created_by) VALUES (?, ?, ?, ?)',
-      [title, content, target_audience || 'All', req.user.id]
-    );
+    const newNotice = new Notice({
+      title,
+      description: content,
+      target_audience: target_audience || 'All',
+      created_by: req.user.id
+    });
+    await newNotice.save();
     res.status(201).json({ message: 'Notice posted successfully' });
   } catch (err) {
     console.error(err);
@@ -51,7 +60,7 @@ exports.createNotice = async (req, res) => {
 exports.deleteNotice = async (req, res) => {
   const { id } = req.params;
   try {
-    await db.query('DELETE FROM notices WHERE id = ?', [id]);
+    await Notice.findByIdAndDelete(id);
     res.json({ message: 'Notice deleted successfully' });
   } catch (err) {
     console.error(err);
