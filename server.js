@@ -102,8 +102,6 @@ app.get('/api/seed', async (req, res) => {
     await Student.deleteMany({});
     await Employee.deleteMany({});
 
-    const defaultPasswordHash = await bcrypt.hash('password123', 10);
-
     // Create Settings
     const settings = new SchoolSettings({
       school_name: 'Secondary School of Modern Education',
@@ -154,7 +152,7 @@ app.get('/api/seed', async (req, res) => {
     const admin = new User({
       name: 'School Administrator',
       email: 'admin@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('admin123', 10),
       role: 'school_admin',
       phone: '+91 98765 43210',
       status: 'active'
@@ -165,7 +163,7 @@ app.get('/api/seed', async (req, res) => {
     const teacherUser = new User({
       name: 'Sarah Connor',
       email: 'teacher@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('teacher123', 10),
       role: 'teacher',
       phone: '+91 98765 43211',
       status: 'active'
@@ -186,7 +184,7 @@ app.get('/api/seed', async (req, res) => {
     const parentUser = new User({
       name: 'John Doe Sr.',
       email: 'parent@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('parent123', 10),
       role: 'parent',
       phone: '+91 98765 43212',
       status: 'active'
@@ -209,7 +207,7 @@ app.get('/api/seed', async (req, res) => {
     const studentUser = new User({
       name: 'Tommy Doe',
       email: 'student@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('student123', 10),
       role: 'student',
       phone: '+91 98765 43214',
       status: 'active'
@@ -235,7 +233,7 @@ app.get('/api/seed', async (req, res) => {
     const hrUser = new User({
       name: 'David Smith',
       email: 'hr@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('hr123', 10),
       role: 'hr',
       phone: '+91 98765 43215',
       status: 'active'
@@ -257,7 +255,7 @@ app.get('/api/seed', async (req, res) => {
     const accountantUser = new User({
       name: 'Emily Davis',
       email: 'accountant@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('accountant123', 10),
       role: 'accountant',
       phone: '+91 98765 43216',
       status: 'active'
@@ -279,7 +277,7 @@ app.get('/api/seed', async (req, res) => {
     const librarianUser = new User({
       name: 'Michael Miller',
       email: 'librarian@eskooly.com',
-      password: defaultPasswordHash,
+      password: await bcrypt.hash('librarian123', 10),
       role: 'librarian',
       phone: '+91 98765 43217',
       status: 'active'
@@ -297,7 +295,7 @@ app.get('/api/seed', async (req, res) => {
     });
     await librarianProfile.save();
 
-    res.json({ message: 'Database seeded successfully with test accounts! Password for all is password123' });
+    res.json({ message: 'Database seeded successfully with role-specific accounts!' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Seeding failed: ' + err.message });
