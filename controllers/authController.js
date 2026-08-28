@@ -449,3 +449,28 @@ exports.setupAdmin = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Refresh Token
+exports.refreshToken = async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    return res.status(401).json({ message: 'Refresh token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user || user.status !== 'active') {
+      return res.status(401).json({ message: 'User not found or inactive' });
+    }
+
+    const tokens = generateTokens(user);
+    res.json({
+      token: tokens.accessToken,
+      refreshToken: tokens.refreshToken
+    });
+  } catch (err) {
+    console.error('Refresh token error:', err);
+    res.status(401).json({ message: 'Invalid refresh token' });
+  }
+};
