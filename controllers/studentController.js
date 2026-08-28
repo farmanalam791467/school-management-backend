@@ -78,7 +78,8 @@ exports.getStudents = async (req, res) => {
       father_phone: student.parent ? student.parent.father_phone : '',
       gender: student.gender || '',
       dob: student.dob,
-      blood_group: student.blood_group || ''
+      blood_group: student.blood_group || '',
+      avatar: student.user ? student.user.avatar : ''
     }));
 
     res.json({
@@ -143,7 +144,8 @@ exports.createStudent = async (req, res) => {
   const {
     name, email, password, phone, gender, dob, roll_number, admission_no,
     class_id, section_id, blood_group, medical_history,
-    father_name, father_phone, father_occupation, mother_name, mother_phone, mother_occupation, address
+    father_name, father_phone, father_occupation, mother_name, mother_phone, mother_occupation, address,
+    avatar
   } = req.body;
 
   try {
@@ -155,6 +157,7 @@ exports.createStudent = async (req, res) => {
       password: hashedPassword,
       role: 'student',
       phone,
+      avatar: avatar || '',
       status: 'active'
     });
     await newUser.save();
